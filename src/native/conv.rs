@@ -55,6 +55,22 @@ impl Module for BandedConv2d {
         let out_width = (padded_width - self.kernel) / self.stride + 1;
         let row_scratch = Self::checked_scratch(batch, 1, out_width, channels, self.kernel)?;
         let rows_per_band = (self.max_scratch_elements / row_scratch).max(1);
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if xs.device().is_metal()
+            && xs.dtype() == candle_core::DType::F32
+            && self.weight.dtype() == candle_core::DType::F32
+        {
+            // Candle's Metal im2col and NCHW copy dominate its convolution
+            // time; channel-major columns feed its fast GEMM directly.
+            let output = super::columns::conv2d(
+                xs,
+                &self.weight,
+                self.stride,
+                self.padding,
+                self.max_scratch_elements,
+            )?;
+            return self.add_bias(output);
+        }
         let output = if rows_per_band >= out_height {
             xs.conv2d(&self.weight, self.padding, self.stride, 1, 1)?
         } else {
@@ -75,6 +91,12 @@ impl Module for BandedConv2d {
             }
             Tensor::cat(&bands, 2)?
         };
+        self.add_bias(output)
+    }
+}
+
+impl BandedConv2d {
+    fn add_bias(&self, output: Tensor) -> Result<Tensor> {
         match &self.bias {
             Some(bias) => {
                 let channels = bias.dims1()?;

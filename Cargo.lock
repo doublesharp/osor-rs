@@ -4807,6 +4807,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "libm",
+ "metal 0.27.0",
  "pollster",
  "safetensors 0.4.5",
  "serde",

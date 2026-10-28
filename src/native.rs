@@ -3,8 +3,12 @@
 //! <https://github.com/huggingface/candle/tree/0.9.1/candle-transformers/src/models/stable_diffusion>
 //! SDXL's additional text/time embedding is applied before every UNet block.
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
+mod columns;
 mod conv;
 mod cross_blocks;
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod metal_bench;
 #[cfg(test)]
 mod precision_tests;
 mod spatial;
