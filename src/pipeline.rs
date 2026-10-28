@@ -404,9 +404,12 @@ impl<B: ModelBackend> Pipeline<B> {
         observer(Stage::OriginalLatent, &original)?;
         let mask = input.mask.max_pool2d(8)?.to_dtype(dtype)?;
         observer(Stage::PooledMask, &mask)?;
-        let noisy =
-            self.scheduler
-                .add_noise(&original, input.diffusion_noise, self.config.timestep)?;
+        // Both operands were checked finite above; skip the scheduler's readback.
+        let noisy = self.scheduler.add_noise_prechecked(
+            &original,
+            input.diffusion_noise,
+            self.config.timestep,
+        )?;
         validate_tensor(&noisy, "noisy latent", &latent_shape, dtype, device, None)?;
         observer(Stage::NoisyLatent, &noisy)?;
         let unet_input = Tensor::cat(&[&noisy, &mask, &original], 1)?;
@@ -459,9 +462,12 @@ impl<B: ModelBackend> Pipeline<B> {
         observer(Stage::AlphaLogits, &logits)?;
         let latent_alpha = candle_nn::ops::sigmoid(&logits)?;
         observer(Stage::LatentAlpha, &latent_alpha)?;
-        let predicted =
-            self.scheduler
-                .predicted_original_sample(&noisy, &denoising, self.config.timestep)?;
+        // `noisy` and the full denoiser output were checked finite above.
+        let predicted = self.scheduler.predicted_original_sample_prechecked(
+            &noisy,
+            &denoising,
+            self.config.timestep,
+        )?;
         validate_tensor(
             &predicted,
             "predicted original",

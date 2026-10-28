@@ -231,7 +231,8 @@ impl Scheduler {
             .ok_or_else(|| Error::InvalidInput("scheduler timestep out of range".into()))
     }
 
-    fn validate_pair(a: &Tensor, b: &Tensor) -> Result<()> {
+    /// Shape, dtype, device and size checks; no device readback.
+    fn validate_layout(a: &Tensor, b: &Tensor) -> Result<()> {
         if a.dims() != b.dims() || a.dtype() != b.dtype() || !a.device().same_device(b.device()) {
             return Err(Error::InvalidInput(
                 "scheduler tensors must have matching shape, dtype, and device".into(),
@@ -253,6 +254,12 @@ impl Scheduler {
                 "scheduler tensor exceeds safety limit".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Layout checks plus a host readback rejecting non-finite values.
+    fn validate_pair(a: &Tensor, b: &Tensor) -> Result<()> {
+        Self::validate_layout(a, b)?;
         for tensor in [a, b] {
             let values = tensor
                 .to_dtype(candle_core::DType::F32)?
@@ -270,6 +277,17 @@ impl Scheduler {
     /// Noise `original` with explicit `noise` at `timestep`.
     pub fn add_noise(&self, original: &Tensor, noise: &Tensor, timestep: usize) -> Result<Tensor> {
         Self::validate_pair(original, noise)?;
+        self.add_noise_prechecked(original, noise, timestep)
+    }
+
+    /// [`Self::add_noise`] for callers that already rejected non-finite inputs.
+    pub(crate) fn add_noise_prechecked(
+        &self,
+        original: &Tensor,
+        noise: &Tensor,
+        timestep: usize,
+    ) -> Result<Tensor> {
+        Self::validate_layout(original, noise)?;
         let a = self.alpha(timestep)?;
         let a = Tensor::new(a, original.device())?.to_dtype(original.dtype())?;
         let original_scale = a.sqrt()?;
@@ -285,6 +303,18 @@ impl Scheduler {
         timestep: usize,
     ) -> Result<Tensor> {
         Self::validate_pair(noisy, model_output)?;
+        self.predicted_original_sample_prechecked(noisy, model_output, timestep)
+    }
+
+    /// [`Self::predicted_original_sample`] for callers that already rejected
+    /// non-finite inputs.
+    pub(crate) fn predicted_original_sample_prechecked(
+        &self,
+        noisy: &Tensor,
+        model_output: &Tensor,
+        timestep: usize,
+    ) -> Result<Tensor> {
+        Self::validate_layout(noisy, model_output)?;
         let a = self.alpha(timestep)?;
         let original_scale = Tensor::new(a.sqrt(), noisy.device())?.to_dtype(noisy.dtype())?;
         let noise_scale =
@@ -382,6 +412,35 @@ mod tests {
                 < 1e-6
         );
         assert!(scheduler.add_noise(&x, &n, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prechecked_paths_match_public_results_and_check_layout() -> Result<()> {
+        let scheduler = Scheduler::new(SchedulerConfig::default())?;
+        let device = &candle_core::Device::Cpu;
+        let x = Tensor::new(&[0.5_f32, -1.0, 2.0, 0.25], device)?;
+        let n = Tensor::new(&[1.0_f32, 0.0, -0.5, 3.0], device)?;
+        let same = |a: &Tensor, b: &Tensor| -> Result<bool> {
+            Ok(a.to_vec1::<f32>()? == b.to_vec1::<f32>()?)
+        };
+        assert!(same(
+            &scheduler.add_noise(&x, &n, 400)?,
+            &scheduler.add_noise_prechecked(&x, &n, 400)?
+        )?);
+        assert!(same(
+            &scheduler.predicted_original_sample(&x, &n, 400)?,
+            &scheduler.predicted_original_sample_prechecked(&x, &n, 400)?
+        )?);
+        let short = Tensor::new(&[1.0_f32], device)?;
+        assert!(scheduler.add_noise_prechecked(&x, &short, 400).is_err());
+        assert!(
+            scheduler
+                .predicted_original_sample_prechecked(&x, &short, 400)
+                .is_err()
+        );
+        let nan = Tensor::new(&[f32::NAN, 0.0, 0.0, 0.0], device)?;
+        assert!(scheduler.add_noise(&x, &nan, 400).is_err());
         Ok(())
     }
 
