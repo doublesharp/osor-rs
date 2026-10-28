@@ -219,7 +219,7 @@ impl ModelBundle {
         let manifest_path = bundle_file(&root, MANIFEST_FILE)?;
         let bytes = read_small_file(&manifest_path, limits.max_manifest_bytes)?;
         if let Some(hash) = expected_hash {
-            let actual = format!("{:x}", Sha256::digest(&bytes));
+            let actual = hex(Sha256::digest(&bytes).as_slice());
             if !actual.eq_ignore_ascii_case(hash) {
                 return Err(artifact_error("manifest SHA256 mismatch"));
             }
@@ -381,6 +381,11 @@ impl SourceProvenance {
         }
         Ok(())
     }
+}
+
+/// Lowercase hexadecimal encoding of a digest.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(crate) fn artifact_error(message: impl Into<String>) -> Error {
@@ -624,7 +629,7 @@ fn validate_info(
         })
         .ok_or_else(|| artifact_error(format!("{name} shape overflows")))?;
     let source_bytes = count
-        .checked_mul(info.dtype.size() as u64)
+        .checked_mul(info.dtype.bitsize() as u64 / 8)
         .ok_or_else(|| artifact_error(format!("{name} byte count overflows")))?;
     let decoded_bytes = count
         .checked_mul(dtype.size_in_bytes() as u64)
@@ -785,7 +790,7 @@ pub(crate) fn read_tensors(
     if reader.get_ref().metadata()?.len() != size {
         return Err(artifact_error("safetensors file changed while reading"));
     }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex(hasher.finalize().as_slice());
     if expected_hash.is_some_and(|expected| !hash.eq_ignore_ascii_case(expected)) {
         return Err(artifact_error(format!(
             "SHA-256 mismatch for {}",
@@ -921,7 +926,7 @@ pub(crate) fn write_tensors(
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex(hasher.finalize().as_slice()))
 }
 
 fn write_hashed(writer: &mut impl Write, hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
@@ -1062,10 +1067,10 @@ mod tests {
                         .map_err(|e| artifact_error(format!("invalid test tensor: {e}")))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let bytes = serialize(views, &None)
+            let bytes = serialize(views, None)
                 .map_err(|e| artifact_error(format!("cannot serialize test tensors: {e}")))?;
             fs::write(path, &bytes)?;
-            Ok(format!("{:x}", Sha256::digest(&bytes)))
+            Ok(hex(Sha256::digest(&bytes).as_slice()))
         }
         manifest.sha256.unet = write_f16(
             &root.join(UNET_FILE),
@@ -1092,7 +1097,7 @@ mod tests {
     fn pinned_limits_count_decoded_bytes_across_bundle_files() -> Result<()> {
         let dir = ScratchDir::new()?;
         let bytes = synthetic_f16_bundle(&dir.0)?;
-        let pin = format!("{:x}", Sha256::digest(&bytes));
+        let pin = hex(Sha256::digest(&bytes).as_slice());
         let unet_elements = 320 * 9 * 3 * 3 + 5 * 320 * 3 * 3 + 5;
         let total_elements = unet_elements + 1 + 77 * 2048 + 1280;
         let decoded_bytes = total_elements * 4;
@@ -1145,7 +1150,7 @@ mod tests {
     fn pinned_runtime_limits_reject_before_graph_validation() -> Result<()> {
         let dir = ScratchDir::new()?;
         let bytes = synthetic_f16_bundle(&dir.0)?;
-        let pin = format!("{:x}", Sha256::digest(&bytes));
+        let pin = hex(Sha256::digest(&bytes).as_slice());
         let limits = ArtifactLimits {
             max_total_tensor_bytes: 1,
             ..ArtifactLimits::default()
@@ -1175,7 +1180,7 @@ mod tests {
     fn manifest_pin_loads_exact_synthetic_bytes_and_rejects_changed_bytes() -> Result<()> {
         let dir = ScratchDir::new()?;
         let bytes = synthetic_bundle(&dir.0)?;
-        let pin = format!("{:x}", Sha256::digest(&bytes));
+        let pin = hex(Sha256::digest(&bytes).as_slice());
         let bundle = ModelBundle::load_with_manifest_sha256(
             &dir.0,
             &Device::Cpu,
@@ -1217,7 +1222,7 @@ mod tests {
     fn manifest_pin_runtime_entrypoint_rejects_before_weight_io() -> Result<()> {
         let dir = ScratchDir::new()?;
         let bytes = synthetic_bundle(&dir.0)?;
-        let pin = format!("{:x}", Sha256::digest(&bytes));
+        let pin = hex(Sha256::digest(&bytes).as_slice());
         let mut changed = bytes;
         changed.push(b'\n');
         fs::write(dir.0.join(MANIFEST_FILE), changed)?;
@@ -1337,7 +1342,7 @@ mod tests {
         let digest = write_tensors(&path, &tensors, &limits)?;
         let mut file_hasher = Sha256::new();
         file_hasher.update(fs::read(&path)?);
-        assert_eq!(digest, format!("{:x}", file_hasher.finalize()));
+        assert_eq!(digest, hex(file_hasher.finalize().as_slice()));
         let (loaded, actual) = read_tensors(
             &path,
             &Device::Cpu,

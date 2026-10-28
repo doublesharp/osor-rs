@@ -18,6 +18,10 @@ use osor_rs::{
 };
 use sha2::{Digest, Sha256};
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn path(name: &str) -> Result<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
         Error::InvalidInput(format!(
@@ -231,7 +235,7 @@ impl ConversionSink for DigestSink {
         self.finished.push((
             output,
             writer.bytes,
-            format!("{:x}", writer.digest.finalize()),
+            hex(writer.digest.finalize().as_slice()),
         ));
         Ok(())
     }
@@ -258,7 +262,7 @@ fn real_model_conversion_io_matches_qualified_bundle() -> Result<()> {
     }
     let expected_pin = std::env::var("OSOR_TEST_MANIFEST_SHA256")
         .map_err(|_| Error::InvalidInput("set OSOR_TEST_MANIFEST_SHA256".into()))?;
-    let actual_pin = format!("{:x}", Sha256::digest(&bytes));
+    let actual_pin = hex(Sha256::digest(&bytes).as_slice());
     assert_eq!(actual_pin, expected_pin.to_ascii_lowercase());
     let expected: Manifest = serde_json::from_slice(&bytes)?;
     expected.validate()?;

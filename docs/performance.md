@@ -2,7 +2,31 @@
 
 The Rust port still trails upstream PyTorch on Apple GPUs. These are engineering measurements on a shared Apple M2 Max with 96 GiB memory, not release benchmarks or a general comparison of programming languages.
 
-## Profiling-build measurements: 2026-10-28 follow-up
+## Current measurements: Candle 0.11
+
+Measured with `--profile profiling` on Candle 0.11.0, Burn 0.22.1 and the column-convolution VAE path. Same inputs, bundle and captured noise as the earlier sections; F32, batch one, two warm runs after one first run; loading excluded from inference times. The host was shared (load average about 15).
+
+| Implementation | Case | Load | Warm mean | Encode / UNet / decode | Peak footprint |
+|---|---|---:|---:|---|---:|
+| Upstream PyTorch 2.7.1 / MPS | 640×384 | — | 0.741 s | — | 16.1 GiB |
+| Rust / Candle Metal | 640×384 | 6.4 s | **2.76 s** | 0.75 / 0.62 / 1.40 s | 11.3 GiB |
+| Rust / Burn WGPU | 640×384 | 9.1 s | 18.2 s | 4.18 / 4.68 / 9.63 s | 10.4 GiB |
+| Rust / Candle CPU | 640×384 | 6.4 s | 22.0 s | 4.88 / 5.13 / 8.60 s | 10.0 GiB |
+| Upstream PyTorch 2.7.1 / CPU, 4 threads | 80×96 | — | 1.003 s | — | — |
+| Rust / Candle CPU, 4 threads | 80×96 | 6.4 s | 1.52 s | 0.16 / 0.98 / 0.36 s | 10.0 GiB |
+
+Stage times come from the separate synchronized profile run and do not sum exactly to the warm mean.
+
+- **Metal, 5.98 s → 3.78 s → 2.76 s.** Candle's Metal convolution builds a pixel-major im2col buffer, runs a GEMM, then copies back to NCHW; at VAE shapes the im2col kernel and copy took most of the time while the GEMM ran at 6–10 TFLOPS. A small Metal kernel now writes channel-major columns so the GEMM output is already NCHW: 2.9–4.4× faster per layer, with bitwise-identical stage outputs (3.78 s). Candle 0.11 then fixed Metal binary ops, which 0.9.1 always ran through its strided kernel (contiguous add 23.6 ms → 2.2 ms on a 126 MB tensor), bringing warm inference to 2.76 s.
+- **CPU.** Candle 0.11's tiled CPU convolution reduces over (ky, kx, channel) where 0.9.1 reduced over (channel, ky, kx). Both are F32-accurate against an F64 reference, but the new order drifted further from PyTorch and failed the frozen 80×96 limits. VAE convolutions on CPU therefore use the same channel-major column path, which restores parity (all 18 stages pass) without slowing the 80×96 case (1.69 s → 1.52 s). The UNet's convolutions inside Candle's ResNet blocks still use Candle's tiled CPU convolution.
+- **WGPU** is unchanged by the Candle upgrade (18.2 s); its VAE stages are the next WGPU bottleneck.
+- Remaining Metal VAE time is spread across group normalization (built from broadcast ops, about 39 ms per full-resolution call), nearest upsampling (14 ms) and per-channel bias adds (14 ms), alongside the column convolutions. Fused Metal kernels for these are the next measured step.
+
+**Opt-in Apple Accelerate no longer helps.** On Candle 0.11 the `accelerate` build measured 2.13 s warm on the 80×96 input (two samples, 1.94 and 2.33 s; encode 0.14 s, UNet 1.96 s, decode 0.22 s), slower than the portable build's 1.52 s because its UNet stage doubled. On Candle 0.9.1 it had been the faster CPU option (1.16 s). It still passes all 18 stages on both cases; measure before enabling it.
+
+Reproduction data is under `/Volumes/Scratch/osor-rs/reports/dependency-upgrade-20261028` and `/Volumes/Scratch/osor-rs/reports/columns-20261028`.
+
+## Follow-up measurements on Candle 0.9.1
 
 Measured with `--profile profiling` (release optimizations plus line tables) after the decoder, banded-convolution, cached cross-attention and overlapped-hashing changes. Same inputs, bundle and captured noise as below; F32, batch one, two warm runs after one first run; loading excluded from inference times. The host was shared (load average 7–30 during runs).
 
@@ -20,7 +44,7 @@ What changed, measured against the earlier records below:
 
 - **CPU, 21.7 s → 1.7 s warm.** The earlier figure came from the dev profile, whose dependencies kept debug assertions and overflow checks. A plain release build already measured 3.0 s; the cached prompt keys and values cut the UNet stage further (1.08 s → 0.69 s at 80×96). The dev profile now disables dependency assertions.
 - **Metal peak footprint, 30.6 GiB → 13.4 GiB.** Candle lowers each convolution to an im2col buffer that Metal rounds up to a power-of-two allocation; one full-resolution 3×3 decoder convolution needed 2.26 GB (a 4 GiB buffer). VAE convolutions now run in bands of output rows with at most 128 MiB of scratch each. Banding alone measured 15.5 GiB; dropping the cached prompt's `attn2.to_k`/`to_v` weights (about 1.27 GiB F32) accounts for most of the rest.
-- **Metal latency, unchanged (5.85 s → 5.98 s).** Metal is GPU-bound: the whole process used about 5.4 s of CPU time. VAE encode (1.78 s) and decode (3.48 s) remain convolution-throughput bound. Candle 0.11.0 lowers Metal convolutions the same way, so a Candle upgrade alone will not close this gap; a dedicated Metal convolution kernel is the next step.
+- **Metal latency, unchanged at that point (5.85 s → 5.98 s).** Metal is GPU-bound: the whole process used about 5.4 s of CPU time. VAE encode (1.78 s) and decode (3.48 s) were convolution-throughput bound; the current section shows the later column-convolution and Candle 0.11 results.
 - **WGPU, 20.5 s → 18.4 s.** Attention now slices query rows only above a 256 MiB score budget, which never triggers within WGPU admission, and the prompt is no longer uploaded per job. The UNet stage fell from 5.88 s to 4.61 s.
 - **Load, about 9.5 s → 7.1 s (Metal).** SHA-256 of the 10.6 GB bundle costs about 4.5 s of CPU on one core. Tensors of 1 MiB or more are now hashed on a helper thread while the tensor is built from the same bytes.
 

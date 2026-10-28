@@ -16,7 +16,7 @@
 
 ---
 
-Supply an image and a removal mask to receive the completed image and the model's predicted edit alpha. The edit can include shadows, reflections, and other effects beyond the painted mask. The runtime uses Candle 0.9.1, with an optional Burn 0.22.0 WGPU backend. It loads explicitly installed local safetensors bundles; there is no Python sidecar, libtorch dependency, runtime text encoder, or automatic model download.
+Supply an image and a removal mask to receive the completed image and the model's predicted edit alpha. The edit can include shadows, reflections, and other effects beyond the painted mask. The runtime uses Candle 0.11.0, with an optional Burn 0.22.1 WGPU backend. It loads explicitly installed local safetensors bundles; there is no Python sidecar, libtorch dependency, runtime text encoder, or automatic model download.
 
 The numerical recipe is pinned to [OSOR revision `d5b68e8`](https://github.com/Zhouqm-Git/osor/tree/d5b68e822996d61aae6ba612e5e9b5a14f576879).
 
@@ -198,7 +198,7 @@ For WGPU, use `--features wgpu` and replace the final `metal` argument with `wgp
 | Backend | Cargo feature | Current boundary |
 |---|---|---|
 | CPU | Default | F32; portable source; macOS real-model execution |
-| CPU + Accelerate | `accelerate` | macOS only; Apple Accelerate matrix products; separately passes both qualification cases |
+| CPU + Accelerate | `accelerate` | macOS only; Apple Accelerate matrix products; passes both qualification cases, but slower than the portable build on Candle 0.11 |
 | Metal | `metal` | macOS; M2 Max small-case and independent photo acceptance |
 | CUDA | `cuda` | Requires an NVIDIA device, compatible driver, toolkit, and host compiler; device acceptance pending |
 | WGPU | `wgpu` | F32; resident GPU graph with CPU staging; M2 Max small-case and independent photo acceptance |
@@ -211,7 +211,7 @@ WGPU keeps UNet and VAE activations on the GPU, while noise, mask, scheduler, an
 
 The port preserves posterior sampling, 8× max-pooled masks, timestep 400, nine-channel UNet input, added text/time conditioning, five-channel output, scheduler predicted-original computation, and latent alpha blending. See the [numerical contract](docs/reference-contract.md).
 
-On the measured 640×384 photo, warm inference averaged **0.74 s for upstream PyTorch MPS, 5.98 s for Rust Metal (13.4 GiB peak), and 18.4 s for Rust WGPU**. On the 80×96 input with four threads, Rust CPU averaged **1.69 s** against 1.00 s for PyTorch CPU. These are two-sample, shared-host observations from the `profiling` build, with loading excluded. Metal remains bound by VAE convolution throughput. See the [performance record](docs/performance.md) for first/warm timings, load time, memory, and measured bottlenecks.
+On the measured 640×384 photo, warm inference averaged **0.74 s for upstream PyTorch MPS, 2.76 s for Rust Metal (11.3 GiB peak), 18.2 s for Rust WGPU, and 22.0 s for portable Rust CPU**. On the 80×96 input with four threads, Rust CPU averaged **1.52 s** against 1.00 s for PyTorch CPU. These are two-sample, shared-host observations from the `profiling` build, with loading excluded. Metal's remaining time is mostly VAE normalization, upsampling and convolution. See the [performance record](docs/performance.md) for first/warm timings, load time, memory, and measured bottlenecks.
 
 <details>
 <summary>Capture, compare, and profile stages</summary>

@@ -186,7 +186,7 @@ pub(crate) fn prepare<R: Read + Seek + ?Sized>(
     if reader.seek(SeekFrom::End(0))? != size {
         return Err(artifact_error("safetensors size changed while verifying"));
     }
-    let sha256 = format!("{:x}", hash.finalize());
+    let sha256 = crate::artifact::hex(hash.finalize().as_slice());
     if !sha256.eq_ignore_ascii_case(expected_sha256) {
         return Err(artifact_error("safetensors SHA-256 mismatch"));
     }
@@ -487,7 +487,7 @@ pub(crate) fn write_output<W: Write>(
     }
     checkpoint(position, plan.size)?;
     writer.flush()?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::artifact::hex(hasher.finalize().as_slice()))
 }
 
 #[cfg(test)]
@@ -505,7 +505,7 @@ mod tests {
         result
     }
     fn digest(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        crate::artifact::hex(Sha256::digest(bytes).as_slice())
     }
     fn sample() -> Vec<u8> {
         source(

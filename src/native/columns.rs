@@ -1,6 +1,6 @@
 //! Channel-major im2col convolution for Metal.
 //!
-//! Candle 0.9.1 lowers a Metal convolution to a pixel-major im2col buffer, a
+//! Candle (0.9.1 through 0.11.0) lowers a Metal convolution to a pixel-major im2col buffer, a
 //! GEMM, and a strided copy back to NCHW. At VAE shapes its im2col kernel and
 //! final copy take most of the time while the GEMM runs at 6-9 TFLOPS. This
 //! module writes `[batch, channels * k * k, pixels]` columns with coalesced
@@ -37,6 +37,43 @@ impl Im2Col {
     }
 }
 
+impl Im2Col {
+    /// Fill column row `index` (`batch * rows + c * k * k + ky * k + kx`).
+    fn fill_row(
+        &self,
+        source: &[f32],
+        (channels, height, width): (usize, usize, usize),
+        rows: usize,
+        index: usize,
+        row: &mut [f32],
+    ) {
+        let k = self.kernel;
+        let (b, tap) = (index / rows, index % rows);
+        let (c, ky, kx) = (tap / (k * k), (tap / k) % k, tap % k);
+        let plane = (b * channels + c) * height;
+        for (oy_local, out_row) in row.chunks_mut(self.out_width).enumerate() {
+            let Some(iy) =
+                ((self.row_start + oy_local) * self.stride + ky).checked_sub(self.padding)
+            else {
+                continue;
+            };
+            if iy >= height {
+                continue;
+            }
+            let Some(input_row) = source.get((plane + iy) * width..(plane + iy + 1) * width) else {
+                continue;
+            };
+            for (ox, value) in out_row.iter_mut().enumerate() {
+                if let Some(ix) = (ox * self.stride + kx).checked_sub(self.padding)
+                    && let Some(&input) = input_row.get(ix)
+                {
+                    *value = input;
+                }
+            }
+        }
+    }
+}
+
 impl CustomOp1 for Im2Col {
     fn name(&self) -> &'static str {
         "osor-im2col"
@@ -53,26 +90,31 @@ impl CustomOp1 for Im2Col {
             .ok_or_else(|| candle_core::Error::Msg("im2col input offset out of range".into()))?;
         let (_, rows, pixels) = self.shape(batch, channels)?;
         let mut columns = vec![0f32; batch * rows * pixels];
-        let k = self.kernel;
-        for (index, value) in columns.iter_mut().enumerate() {
-            let pixel = index % pixels;
-            let row = (index / pixels) % rows;
-            let b = index / (pixels * rows);
-            let (c, ky, kx) = (row / (k * k), (row / k) % k, row % k);
-            let oy = self.row_start + pixel / self.out_width;
-            let ox = pixel % self.out_width;
-            let iy = (oy * self.stride + ky).checked_sub(self.padding);
-            let ix = (ox * self.stride + kx).checked_sub(self.padding);
-            if let (Some(iy), Some(ix)) = (iy, ix)
-                && iy < height
-                && ix < width
-            {
-                *value = source
-                    .get(((b * channels + c) * height + iy) * width + ix)
-                    .copied()
-                    .unwrap_or(0.0);
-            }
+        if pixels == 0 {
+            return Ok((CpuStorage::F32(columns), Shape::from((batch, rows, pixels))));
         }
+        // Each column row is one (batch, channel, ky, kx) tap over the band's
+        // output pixels; rows are filled in parallel with whole-row copies.
+        let threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let rows_per_thread = (batch * rows).div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (chunk_index, chunk) in columns.chunks_mut(rows_per_thread * pixels).enumerate() {
+                scope.spawn(move || {
+                    for (offset, row) in chunk.chunks_mut(pixels).enumerate() {
+                        self.fill_row(
+                            source,
+                            (channels, height, width),
+                            rows,
+                            chunk_index * rows_per_thread + offset,
+                            row,
+                        );
+                    }
+                });
+            }
+        });
         Ok((CpuStorage::F32(columns), Shape::from((batch, rows, pixels))))
     }
 
@@ -88,10 +130,11 @@ impl CustomOp1 for Im2Col {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_kernel {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use candle_core::{DType, Layout, MetalStorage, Result, Shape, backend::BackendStorage};
-    use metal::{CompileOptions, ComputePipelineState, MTLSize};
+    use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline, Device};
+    use objc2_metal::MTLSize;
 
     use super::Im2Col;
 
@@ -138,26 +181,33 @@ kernel void osor_im2col_f32(
     }
 
     /// Compiled pipelines keyed by Metal device registry ID.
-    static PIPELINES: Mutex<Vec<(u64, ComputePipelineState)>> = Mutex::new(Vec::new());
+    static PIPELINES: Mutex<Vec<(u64, Arc<ComputePipeline>)>> = Mutex::new(Vec::new());
 
-    fn pipeline(device: &metal::DeviceRef) -> Result<ComputePipelineState> {
+    fn kernel_error(error: impl std::fmt::Display) -> candle_core::Error {
+        candle_core::Error::Msg(format!("im2col kernel: {error}"))
+    }
+
+    fn pipeline(device: &Device) -> Result<Arc<ComputePipeline>> {
         let mut cached = PIPELINES
             .lock()
             .map_err(|_| candle_core::Error::Msg("im2col pipeline cache poisoned".into()))?;
         let id = device.registry_id();
         if let Some((_, pipeline)) = cached.iter().find(|(key, _)| *key == id) {
-            return Ok(pipeline.clone());
+            return Ok(Arc::clone(pipeline));
         }
+        // Pure data movement: default compile options cannot change results.
         let library = device
-            .new_library_with_source(SOURCE, &CompileOptions::new())
-            .map_err(candle_core::Error::Msg)?;
+            .new_library_with_source(SOURCE, None)
+            .map_err(kernel_error)?;
         let function = library
             .get_function("osor_im2col_f32", None)
-            .map_err(candle_core::Error::Msg)?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(candle_core::Error::Msg)?;
-        cached.push((id, pipeline.clone()));
+            .map_err(kernel_error)?;
+        let pipeline = Arc::new(
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(kernel_error)?,
+        );
+        cached.push((id, Arc::clone(&pipeline)));
         Ok(pipeline)
     }
 
@@ -192,26 +242,27 @@ kernel void osor_im2col_f32(
             rows: u32_of(op.rows)?,
         };
         let pipeline = pipeline(device.metal_device())?;
-        let command_buffer = device.command_buffer()?;
-        command_buffer.set_label("osor-im2col");
-        let encoder = command_buffer.new_compute_command_encoder();
+        let guard = device.command_encoder()?;
+        let encoder: &ComputeCommandEncoder = guard.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         let offset = layout.start_offset() * DType::F32.size_in_bytes();
-        let source: &metal::BufferRef = storage.buffer();
-        let target: &metal::BufferRef = &columns;
-        encoder.set_buffer(0, Some(source), offset as u64);
-        encoder.set_buffer(1, Some(target), 0);
-        encoder.set_bytes(
-            2,
-            std::mem::size_of::<Params>() as u64,
-            std::ptr::from_ref(&params).cast(),
-        );
-        let group = pipeline.thread_execution_width().max(1) * 4;
+        encoder.set_input_buffer(0, Some(storage.buffer()), offset);
+        encoder.set_output_buffer(1, Some(columns.as_ref()), 0);
+        encoder.set_bytes(2, &params);
+        let group = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
-            MTLSize::new(pixels as u64, rows as u64, batch as u64),
-            MTLSize::new(group.min(pixels as u64).max(1), 1, 1),
+            MTLSize {
+                width: pixels,
+                height: rows,
+                depth: batch,
+            },
+            MTLSize {
+                width: group.min(pixels).max(1),
+                height: 1,
+                depth: 1,
+            },
         );
-        encoder.end_encoding();
+        drop(guard);
         Ok((
             MetalStorage::new(columns, device.clone(), count, DType::F32),
             Shape::from((batch, rows, pixels)),

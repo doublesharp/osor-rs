@@ -130,7 +130,7 @@ mod tests {
         };
         let variables = nn::VarMap::new();
         let candle = AutoEncoderKL::new(
-            VarBuilder::from_varmap(&variables, DType::F32, device),
+            VarBuilder::from_varmap(&variables, DType::F64, device),
             3,
             3,
             AutoEncoderKLConfig {
@@ -143,12 +143,14 @@ mod tests {
             },
         )?;
         let ours = VaeDecoder::new(
-            VarBuilder::from_varmap(&variables, DType::F32, device),
+            VarBuilder::from_varmap(&variables, DType::F64, device),
             &arch,
         )?;
-        // A 2x2 latent decodes to 16x16; with one channel per group every
-        // normalization reduces at most 256 elements in a single pass.
-        let latents = Tensor::randn(0f32, 1f32, (2, 4, 2, 2), device)?;
+        // F64 keeps convolutions on Candle's path (F32 CPU and Metal use the
+        // channel-major column order). A 2x2 latent decodes to 16x16; with one
+        // channel per group every normalization reduces at most 256 elements
+        // in a single pass.
+        let latents = Tensor::randn(0f64, 1f64, (2, 4, 2, 2), device)?;
         let expected = candle.decode(&latents)?;
         let actual = ours.forward(&latents, &|| Ok(()))?;
         assert_eq!(actual.dims(), &[2, 3, 16, 16]);
@@ -156,9 +158,9 @@ mod tests {
             .abs()?
             .flatten_all()?
             .max(0)?
-            .to_scalar::<f32>()?;
+            .to_scalar::<f64>()?;
         assert!(
-            difference <= 1e-6,
+            difference <= 1e-12,
             "decoder differs from Candle by {difference}"
         );
         Ok(())

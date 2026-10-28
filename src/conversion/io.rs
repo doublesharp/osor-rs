@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn verifies_all_sources_before_decoding_or_graph_validation() -> Result<()> {
         let bytes = tiny_source();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let hash = crate::artifact::hex(Sha256::digest(&bytes).as_slice());
         let calls = Cell::new(0);
         let mut a = Reader {
             cursor: Cursor::new(bytes.clone()),
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn late_hash_mismatch_and_aggregate_input_cap_precede_decode() {
         let bytes = tiny_source();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let hash = crate::artifact::hex(Sha256::digest(&bytes).as_slice());
         for over_budget in [false, true] {
             let mut config = options(&hash);
             if over_budget {
@@ -829,7 +829,10 @@ mod tests {
                 identity,
                 ConversionOutput::Unet | ConversionOutput::Vae | ConversionOutput::Prompt
             ));
-            assert_eq!(&format!("{:x}", Sha256::digest(bytes)), expected);
+            assert_eq!(
+                &crate::artifact::hex(Sha256::digest(bytes).as_slice()),
+                expected
+            );
         }
         let decoded: Manifest = serde_json::from_slice(&sink.published[0])?;
         assert_eq!(decoded.sha256.unet, manifest.sha256.unet);

@@ -115,7 +115,11 @@ measurements separately.
 
 Install the target's Rust standard library with `rustup target add <triple>` and
 provide a compatible target linker, sysroot, and native libraries for the chosen
-host/target pair. Set the corresponding Cargo target linker configuration, then
+host/target pair. Candle 0.10 and later always depend on `tokenizers` with the
+Oniguruma C library, so even a CPU cross check compiles C for the target. From
+macOS, `cargo-zigbuild` with Zig as the cross C compiler builds and links both
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`:
+`./scripts/cargo.sh zigbuild --locked --all-targets --target <triple>`. Set the corresponding Cargo target linker configuration, then
 for example run `./scripts/cargo.sh check --locked --all-targets --target
 <triple>`. GPU cross builds additionally need a compatible target GPU SDK and
 native toolchain. A cross check does not run target binaries; execute tests and

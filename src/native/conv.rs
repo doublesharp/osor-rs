@@ -55,8 +55,7 @@ impl Module for BandedConv2d {
         let out_width = (padded_width - self.kernel) / self.stride + 1;
         let row_scratch = Self::checked_scratch(batch, 1, out_width, channels, self.kernel)?;
         let rows_per_band = (self.max_scratch_elements / row_scratch).max(1);
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if xs.device().is_metal()
+        if (xs.device().is_metal() || xs.device().is_cpu())
             && xs.dtype() == candle_core::DType::F32
             && self.weight.dtype() == candle_core::DType::F32
         {
@@ -150,14 +149,18 @@ mod tests {
 
     fn exact(a: &Tensor, b: &Tensor) -> Result<bool> {
         Ok(a.dims() == b.dims()
-            && (a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()? == 0.0)
+            && (a - b)?
+                .abs()?
+                .flatten_all()?
+                .to_dtype(DType::F64)?
+                .max(0)?
+                .to_scalar::<f64>()?
+                == 0.0)
     }
 
     #[test]
-    fn banded_convolution_matches_direct_convolution_exactly() -> Result<()> {
+    fn banded_convolution_is_band_independent_and_matches_candle() -> Result<()> {
         let device = &Device::Cpu;
-        let variables = nn::VarMap::new();
-        let vs = VarBuilder::from_varmap(&variables, DType::F32, device);
         // (input height, width, kernel, stride, padding, scratch rows)
         for (index, (height, width, kernel, stride, padding, rows)) in [
             (37, 20, 3, 1, 1, 4),
@@ -168,27 +171,52 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let conv = conv2d(6, 5, kernel, stride, padding, vs.pp(index))?;
-            let input = Tensor::randn(0f32, 1f32, (2, 6, height, width), device)?;
             let out_width = (width + 2 * padding - kernel) / stride + 1;
-            let banded = conv
-                .clone()
-                .with_scratch_limit(2 * out_width * 6 * kernel * kernel * rows)
+            let limit = 2 * out_width * 6 * kernel * kernel * rows;
+            for dtype in [DType::F32, DType::F64] {
+                // F32 runs the channel-major column path; F64 runs the generic
+                // banded fallback used for other dtypes and devices.
+                let variables = nn::VarMap::new();
+                let vs = VarBuilder::from_varmap(&variables, dtype, device);
+                let conv = conv2d(6, 5, kernel, stride, padding, vs.pp(index))?;
+                let input =
+                    Tensor::randn(0f32, 1f32, (2, 6, height, width), device)?.to_dtype(dtype)?;
+                let banded = conv.clone().with_scratch_limit(limit).forward(&input)?;
+                let one_band = conv
+                    .clone()
+                    .with_scratch_limit(usize::MAX)
+                    .forward(&input)?;
+                let direct = nn::Conv2d::new(
+                    conv.weight.clone(),
+                    conv.bias.clone(),
+                    nn::Conv2dConfig {
+                        padding,
+                        stride,
+                        ..Default::default()
+                    },
+                )
                 .forward(&input)?;
-            let direct = nn::Conv2d::new(
-                conv.weight.clone(),
-                conv.bias.clone(),
-                nn::Conv2dConfig {
-                    padding,
-                    stride,
-                    ..Default::default()
-                },
-            )
-            .forward(&input)?;
-            assert!(
-                exact(&banded, &direct)?,
-                "banded convolution differs for case {index}"
-            );
+                assert!(
+                    exact(&banded, &one_band)?,
+                    "{dtype:?} banding changes case {index}"
+                );
+                if dtype == DType::F64 {
+                    assert!(
+                        exact(&banded, &direct)?,
+                        "F64 fallback differs from Candle for case {index}"
+                    );
+                } else {
+                    let difference = (banded - direct)?
+                        .abs()?
+                        .flatten_all()?
+                        .max(0)?
+                        .to_scalar::<f32>()?;
+                    assert!(
+                        difference <= 1e-5,
+                        "F32 case {index} differs by {difference}"
+                    );
+                }
+            }
         }
         Ok(())
     }

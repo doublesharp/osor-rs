@@ -9,7 +9,7 @@ description = "Native Rust OSOR SDXL Phase II inference"
 
 [features]
 default = []
-metal = ["dep:candle-metal-kernels", "dep:metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = ["dep:candle-metal-kernels", "dep:objc2-metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["dep:candle-kernels", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 wgpu = ["dep:burn", "dep:pollster"]
 # macOS only: route Candle CPU matrix products through Apple Accelerate.
@@ -17,27 +17,25 @@ wgpu = ["dep:burn", "dep:pollster"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 
 [dependencies]
-candle-core = { version = "=0.9.1", default-features = false }
-candle-nn = { version = "=0.9.1", default-features = false }
-candle-transformers = { version = "=0.9.1", default-features = false }
-# Candle 0.9.1 uses APIs removed by the semver-compatible 0.9.2 kernels.
-candle-metal-kernels = { version = "=0.9.1", optional = true }
-candle-kernels = { version = "=0.9.1", optional = true }
-# Same Metal bindings as Candle 0.9.1, for the column convolution kernel.
-metal = { version = "=0.27.0", optional = true }
+candle-core = { version = "=0.11.0", default-features = false }
+candle-nn = { version = "=0.11.0", default-features = false }
+candle-transformers = { version = "=0.11.0", default-features = false }
+# Kernel crates must match candle-core exactly; the Metal column kernel uses
+# candle-metal-kernels' safe Metal wrappers.
+candle-metal-kernels = { version = "=0.11.0", optional = true }
+candle-kernels = { version = "=0.11.0", optional = true }
+# Same Metal bindings as candle-metal-kernels; only `MTLSize` is named here.
+objc2-metal = { version = "=0.3.2", optional = true, default-features = false, features = ["MTLTypes"] }
 # Pure-Rust math keeps seeded noise identical across platform math libraries.
 libm = "=0.2.16"
-safetensors = "=0.4.5"
+safetensors = "=0.8.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "=0.10.9"
+sha2 = "=0.11.1"
 thiserror = "2.0"
-burn = { version = "=0.22.0", default-features = false, features = ["std", "wgpu"], optional = true }
-pollster = { version = "=0.4.0", optional = true }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "wgpu"], optional = true }
+pollster = { version = "=1.0.1", optional = true }
 
-# Enable AArch64 SHA-256 acceleration on Apple; unsupported CPUs use software.
-[target.'cfg(all(target_arch = "aarch64", target_vendor = "apple"))'.dependencies]
-sha2 = { version = "=0.10.9", features = ["asm"] }
 
 [lints.rust]
 unsafe_code = "forbid"

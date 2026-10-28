@@ -1,9 +1,8 @@
-//! Native SDXL layers. Block orchestration follows Candle's stable-diffusion
-//! UNet and VAE implementations (candle-transformers 0.9.1, MIT/Apache-2.0):
+//! Native SDXL layers on Candle 0.11. Block orchestration was adapted from
+//! Candle's stable-diffusion UNet and VAE (candle-transformers 0.9.1, MIT/Apache-2.0):
 //! <https://github.com/huggingface/candle/tree/0.9.1/candle-transformers/src/models/stable_diffusion>
 //! SDXL's additional text/time embedding is applied before every UNet block.
 
-#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 mod columns;
 mod conv;
 mod cross_blocks;

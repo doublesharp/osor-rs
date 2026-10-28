@@ -45,11 +45,10 @@ unknown-git = "deny"
 [advisories]
 # Each ignore names why the affected code is unreachable from this crate.
 ignore = [
-    # zip 1.3.1 is pinned by candle-core 0.9.1 (`zip = "^1.1.1"`) for .npz and
-    # PyTorch zip readers. These advisories concern `ZipArchive::extract`;
-    # Candle never calls it, and osor-rs never opens npz or pickle archives.
-    # Remove when Candle is upgraded to a release using a patched zip.
-    { id = "RUSTSEC-2025-0168", reason = "zip extract path; not called by Candle or osor-rs" },
+    # candle-core 0.11.0 requires `zip = "^8.6.0"` for .npz and PyTorch zip
+    # readers; the fix is in zip 9. These advisories concern
+    # `ZipArchive::extract`; Candle never calls it, and osor-rs never opens npz
+    # or pickle archives. Remove when Candle moves to zip 9.
     { id = "RUSTSEC-2026-0367", reason = "zip extract path; not called by Candle or osor-rs" },
     { id = "RUSTSEC-2026-0368", reason = "zip extract path; not called by Candle or osor-rs" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract path; not called by Candle or osor-rs" },

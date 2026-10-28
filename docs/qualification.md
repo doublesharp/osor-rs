@@ -44,6 +44,19 @@ All models, inputs, explicit noises, reference captures, comparison reports, mea
 
 The bundle manifest identifies the exact source revisions, licenses, conversion-input hashes, and model-file hashes. The independent dataset is CORNE-Val revision `6d1c6c9bd0822e16bb5293b3d9ef2f6269222baf`; source image/mask hashes and preprocessing are recorded alongside the input. No weights or dataset images are distributed in this repository.
 
+## Dependency upgrade: Candle 0.11
+
+The library now depends on Candle 0.11.0, safetensors 0.8.0, sha2 0.11.1, Burn 0.22.1 and pollster 1.0.1, with every transitive dependency at its latest Rust 1.95-compatible release (`generic-array` stays at 0.14.7 because 0.14.9 requires a newer compiler). All 18 stages were rerun against the same frozen files with the `profiling` build:
+
+| Backend | 80×96, `wgpu-f32-tolerances-v1` | 640×384, `full-photo-f32-tolerances-v1` | Photo decoded max / RMS |
+|---|---|---|---|
+| CPU | 18/18 pass | 18/18 pass | 0.00012127 / 0.000002556 |
+| Metal | 18/18 pass | 18/18 pass | 0.00026733 / 0.000002626 |
+| WGPU | 18/18 pass | 18/18 pass | 0.00029010 / 0.000004027 |
+| CPU + `accelerate` | 18/18 pass | 18/18 pass | 0.00016105 / 0.000002851 |
+
+The full-bundle missing-critical-weight test passes. On the first CPU run, Candle 0.11's tiled CPU convolution failed the 80×96 limits (decoded image maximum 0.0021 against 0.001; alpha logits 1.09e-4 against 1e-4) although its F64-referenced error was ordinary F32 rounding: its reduction order differs from PyTorch's. VAE convolutions on CPU now use the channel-major column path, which restored all 18 stages; the 80×96 CPU decoded maximum is 0.00054526, below the 0.00082076 measured on Candle 0.9.1. Tolerances were not changed. The CPU photo maximum rose from 0.00007838 to 0.00012127 because the UNet's convolutions still use Candle's tiled CPU convolution. Logs are under `/Volumes/Scratch/osor-rs/reports/dependency-upgrade-20261028`.
+
 ## Review follow-up: 2026-10-28
 
 The follow-up replaced Candle's `AutoEncoderKL` decoder with an owned decoder using the bounded group normalization already used by the encoder, ran VAE convolutions in bands of output rows, computed the fixed prompt's cross-attention keys and values once at load on both native and WGPU graphs, removed WGPU's fixed 64-query attention slicing below a 256 MiB score budget, and overlapped bundle hashing with tensor construction. Every change was rerun against the frozen files above with the `profiling` build:
