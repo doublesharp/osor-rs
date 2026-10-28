@@ -4,8 +4,8 @@ The complete Phase II model has executed on macOS/aarch64, Apple M2 Max, with CP
 
 ## Unreleased follow-up
 
-This section records the follow-up committed as `b370d0d` and its loader
-resource-error correction. Subsequent attention-memory, cancellation,
+This section records snapshot `c08bdb9`: the follow-up committed as `b370d0d`
+and its loader resource-error correction. Subsequent attention-memory, cancellation,
 validation-transfer and WGPU-preflight changes require their own verification.
 
 These inference algorithms pass all 18 stages on both original cases for
@@ -19,7 +19,8 @@ accuracy improvement: the CPU photo maximum did not improve.
 Broader checks uncovered and repaired distinct-image VAE batch corruption.
 CPU attention now materializes the transposed input before projection; Metal
 VAE attention evaluates each image separately. Deterministic B2/B4 operator
-regressions failed before the repairs and now match separate calls exactly.
+regressions failed before the repairs and observed zero differences afterward
+in the measured fixtures; their acceptance threshold is `1e-5`.
 The current CPU real-model posterior for the controlled second B2 entry also
 matches its separate call bit for bit. Remaining errors for the first B2 entry
 also occur when that entry runs alone.
@@ -46,8 +47,8 @@ these inputs resize and sometimes flip the preserved CORNE-Val photos.
 Broader numerical acceptance remains open, including the residual odd-size
 and alpha errors; admission does not promise agreement with either envelope.
 
-For this snapshot, CPU and Accelerate ordinary suites pass 96 tests each; combined
-Metal/WGPU ordinary tests pass 98. Formatting, strict Clippy, doctests and
+For this snapshot, CPU and Accelerate ordinary suites pass 96 tests each;
+combined Metal/WGPU ordinary tests pass 98. Formatting, strict Clippy, doctests and
 warning-free rustdoc pass. Bitwise convolution/cache fixtures use exact
 dyadic coefficients on both portable CPU and Accelerate, with separate F64
 numerical checks. The 776-case Pillow oracle compares 5,912,751 output bytes
@@ -55,16 +56,22 @@ with zero mismatches. See [preprocessing](preprocessing.md) for its scope.
 The reviewed convolution thread-creation panic path and the analogous bundle
 hashing path now use fallible spawning with injected-failure regressions.
 
-Unsuppressed feature checks, actual Metal operator/batch checks, WGPU operator
-and lifecycle checks, and Linux/Windows CPU cross-builds are recorded under
-`/Volumes/Scratch/osor-rs/reports/codex-integration-20261028`. Broader inputs,
-references, failures and source fingerprints remain under
-`/Volumes/Scratch/osor-rs/reports/codex-finish-20261028`. Model loading verifies
-the original pinned bytes. Later changes to exactness fixtures, operational
-error classification and package license metadata do not change the measured
-inference algorithms. Native
-Linux/Windows full-model execution, CUDA device execution and reduced-precision
-acceptance remain separate gates.
+The exact `c08bdb9` Git tree was exported separately, and all 67 files were
+verified against their Git blobs before the checks and remained unchanged
+afterward. From that immutable export, `zigbuild --locked --all-targets`
+passed for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`, and
+`check --locked --all-targets --features wgpu-autotune` passed. The isolated
+logs, commands, source archive and verification hashes are under
+`/Volumes/Scratch/osor-rs/reports/verify-c08bdb9-20261028`.
+
+Other feature, device and numerical records remain under
+`/Volumes/Scratch/osor-rs/reports/codex-integration-20261028` and
+`/Volumes/Scratch/osor-rs/reports/codex-finish-20261028`. Earlier `final-*`
+cross-build/autotune logs are preceding-source evidence only; the later
+`release-*` logs include concurrent working-tree changes and are excluded
+from this snapshot's cross-build and autotune proof. Model loading verifies
+the original pinned bytes. Native Linux/Windows full-model execution, CUDA
+device execution and reduced-precision acceptance remain separate gates.
 
 ## v0.2.0 numerical results
 
