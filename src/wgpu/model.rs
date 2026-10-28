@@ -39,11 +39,18 @@ struct Unet {
     up: Vec<UpBlock>,
     norm: GroupNorm,
     output: Conv,
+    pooled: Tensor<2>,
     device: Device,
 }
 
 impl Unet {
-    fn new(w: &mut super::Weights, device: &Device) -> Result<Self> {
+    /// `sequence` `[1, 77, 2048]` and `pooled` `[1, 1280]` are the fixed prompt.
+    fn new(
+        w: &mut super::Weights,
+        device: &Device,
+        sequence: &Tensor<3>,
+        pooled: Tensor<2>,
+    ) -> Result<Self> {
         let channels = [320, 640, 1280];
         let depths = [0, 2, 10];
         let heads = [5, 10, 20];
@@ -72,7 +79,7 @@ impl Unet {
                         w,
                         &format!("{p}.attentions.{j}"),
                         out,
-                        2048,
+                        sequence,
                         heads[i],
                         depths[i],
                     )?);
@@ -100,7 +107,7 @@ impl Unet {
         }
         let mid = MidBlock {
             first: Resnet::new(w, "mid_block.resnets.0", 1280, 1280, Some(1280), 1e-5)?,
-            attention: Transformer::new(w, "mid_block.attentions.0", 1280, 2048, 20, 10)?,
+            attention: Transformer::new(w, "mid_block.attentions.0", 1280, sequence, 20, 10)?,
             second: Resnet::new(w, "mid_block.resnets.1", 1280, 1280, Some(1280), 1e-5)?,
         };
         let mut up = Vec::new();
@@ -128,7 +135,7 @@ impl Unet {
                         w,
                         &format!("{p}.attentions.{j}"),
                         out,
-                        2048,
+                        sequence,
                         heads[index],
                         depths[index],
                     )?);
@@ -165,17 +172,11 @@ impl Unet {
             up,
             norm,
             output,
+            pooled,
             device: device.clone(),
         })
     }
-    fn forward(
-        &self,
-        input: Tensor<4>,
-        timestep: usize,
-        sequence: Tensor<3>,
-        pooled: Tensor<2>,
-        time_ids: Tensor<2>,
-    ) -> Result<Tensor<4>> {
+    fn forward(&self, input: Tensor<4>, timestep: usize, time_ids: Tensor<2>) -> Result<Tensor<4>> {
         let batch = input.dims()[0];
         let t = Tensor::<1>::full(
             [batch],
@@ -187,14 +188,17 @@ impl Unet {
             .added
             .project(time_ids.reshape([batch * 6]))
             .reshape([batch, 6 * 256]);
-        let embedding = normal + self.added.forward(Tensor::cat(vec![pooled, ids], 1));
+        let embedding = normal
+            + self
+                .added
+                .forward(Tensor::cat(vec![self.pooled.clone(), ids], 1));
         let mut x = self.input.forward(input);
         let mut skips = vec![x.clone()];
         for block in &self.down {
             for (i, resnet) in block.resnets.iter().enumerate() {
                 x = resnet.forward(x, Some(&embedding));
                 if let Some(attention) = block.attention.get(i) {
-                    x = attention.forward(x, &sequence);
+                    x = attention.forward(x);
                 }
                 skips.push(x.clone());
             }
@@ -204,7 +208,7 @@ impl Unet {
             }
         }
         x = self.mid.first.forward(x, Some(&embedding));
-        x = self.mid.attention.forward(x, &sequence);
+        x = self.mid.attention.forward(x);
         x = self.mid.second.forward(x, Some(&embedding));
         for block in &self.up {
             for (i, resnet) in block.resnets.iter().enumerate() {
@@ -213,7 +217,7 @@ impl Unet {
                 })?;
                 x = resnet.forward(Tensor::cat(vec![x, skip], 1), Some(&embedding));
                 if let Some(attention) = block.attention.get(i) {
-                    x = attention.forward(x, &sequence);
+                    x = attention.forward(x);
                 }
             }
             if let Some(conv) = &block.upsample {
@@ -239,14 +243,17 @@ pub struct Graph {
     vae: Vae,
 }
 impl Graph {
-    /// Consume and shape-check every required checkpoint tensor.
+    /// Consume and shape-check every required checkpoint tensor and bind the
+    /// fixed prompt conditioning.
     pub fn new(
         unet: &mut super::Weights,
         vae: &mut super::Weights,
         device: &Device,
+        sequence: &Tensor<3>,
+        pooled: Tensor<2>,
     ) -> Result<Self> {
         Ok(Self {
-            unet: Unet::new(unet, device)?,
+            unet: Unet::new(unet, device, sequence, pooled)?,
             vae: Vae::new(vae)?,
         })
     }
@@ -259,12 +266,9 @@ impl Graph {
         &self,
         input: Tensor<4>,
         timestep: usize,
-        sequence: Tensor<3>,
-        pooled: Tensor<2>,
         time_ids: Tensor<2>,
     ) -> Result<Tensor<4>> {
-        self.unet
-            .forward(input, timestep, sequence, pooled, time_ids)
+        self.unet.forward(input, timestep, time_ids)
     }
     /// Decode unscaled VAE latents into raw RGB values.
     pub fn decode(&self, latents: Tensor<4>) -> Tensor<4> {

@@ -18,9 +18,13 @@ use burn::tensor::wgpu::{WgpuSetup, wgpu};
 use burn::tensor::{Device, Tensor as BurnTensor, TensorData};
 use candle_core::{DType, Device as CandleDevice, Tensor};
 
-use crate::{Error, Result, pipeline::ModelBackend};
+use crate::{
+    Error, Result,
+    pipeline::{ModelBackend, valid_image_axis},
+};
 
-const MAX_PIXELS: usize = 512 * 512;
+/// WGPU admission bound on image pixels; batch is limited to one.
+pub(crate) const MAX_PIXELS: usize = 512 * 512;
 // Larger than every tensor in the pinned architecture, while bounding a single
 // conversion even if this interface is called outside the artifact loader.
 const MAX_WEIGHT_ELEMENTS: usize = 64 * 1024 * 1024;
@@ -304,10 +308,8 @@ fn image_shape(tensor: &Tensor, channels: usize, latent: bool, name: &str) -> Re
     let image_height = height.checked_mul(scale);
     let image_width = width.checked_mul(scale);
     let valid_axes = image_height.zip(image_width).is_some_and(|(h, w)| {
-        (32..=1024).contains(&h)
-            && (32..=1024).contains(&w)
-            && h.is_multiple_of(8)
-            && w.is_multiple_of(8)
+        valid_image_axis(h)
+            && valid_image_axis(w)
             && h.checked_mul(w).is_some_and(|pixels| pixels <= MAX_PIXELS)
     });
     if batch != 1 || actual_channels != channels || !valid_axes {
@@ -381,17 +383,23 @@ pub struct WgpuModel {
 }
 
 impl WgpuModel {
-    /// Load validated checkpoint tensors and wait for their GPU uploads.
+    /// Load validated checkpoint tensors and the fixed CPU F32 prompt
+    /// embeddings (`[1, 77, 2048]`, `[1, 1280]`), then wait for GPU uploads.
     pub fn new(
         unet: HashMap<String, Tensor>,
         vae: HashMap<String, Tensor>,
+        sequence: &Tensor,
+        pooled: &Tensor,
         ordinal: usize,
     ) -> Result<Self> {
         let generation = acquire_generation(ordinal)?;
         guarded_model(&generation, "model initialization", || {
+            let sequence = upload(sequence, "sequence", [1, 77, 2048], &generation.device)?;
+            let pooled = upload(pooled, "pooled", [1, 1280], &generation.device)?;
             let mut unet = Weights::for_generation(unet, &generation);
             let mut vae = Weights::for_generation(vae, &generation);
-            let graph = model::Graph::new(&mut unet, &mut vae, &generation.device)?;
+            let graph =
+                model::Graph::new(&mut unet, &mut vae, &generation.device, &sequence, pooled)?;
             generation.device.sync().map_err(|e| {
                 generation.mark_lost();
                 Error::Unavailable(format!("WGPU weight upload synchronization failed: {e}"))
@@ -432,14 +440,7 @@ impl ModelBackend for WgpuModel {
         })
     }
 
-    fn denoise(
-        &self,
-        input: &Tensor,
-        timestep: usize,
-        sequence: &Tensor,
-        pooled: &Tensor,
-        time_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
         guarded_model(&self.generation, "UNet", || {
             let [b, _, h, w] = image_shape(input, 9, true, "UNet input")?;
             if timestep >= 100_000 {
@@ -448,12 +449,9 @@ impl ModelBackend for WgpuModel {
                 ));
             }
             let input = upload(input, "UNet input", [b, 9, h, w], &self.generation.device)?;
-            let sequence = upload(sequence, "sequence", [1, 77, 2048], &self.generation.device)?;
-            let pooled = upload(pooled, "pooled", [1, 1280], &self.generation.device)?;
             let time_ids = upload(time_ids, "time_ids", [1, 6], &self.generation.device)?;
             readback_impl(
-                self.graph
-                    .denoise(input, timestep, sequence, pooled, time_ids)?,
+                self.graph.denoise(input, timestep, time_ids)?,
                 [b, 5, h, w],
                 "UNet output",
                 Some(&self.generation),

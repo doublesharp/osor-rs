@@ -192,12 +192,45 @@ impl Resnet {
         residual + self.conv2.forward(activation::silu(self.norm2.forward(y)))
     }
 }
+/// Default bound on one attention score slice: 64 Mi F32 elements (256 MiB).
+const MAX_SCORE_ELEMENTS: usize = 64 * 1024 * 1024;
+
+/// Scaled-dot-product attention over `q [b,h,n,d]`, `k_t [b,h,d,t]` and
+/// `v [b,h,t,d]`. Query rows are sliced only when the full score matrix would
+/// exceed `max_score_elements`.
+fn attend(
+    q: Tensor<4>,
+    k_t: Tensor<4>,
+    v: Tensor<4>,
+    head_width: usize,
+    max_score_elements: usize,
+) -> Tensor<3> {
+    let [b, heads, n, d] = q.dims();
+    let tokens = k_t.dims()[3];
+    let row_elements = b.saturating_mul(heads).saturating_mul(tokens).max(1);
+    let rows = (max_score_elements / row_elements).clamp(1, n.max(1));
+    let scale = (head_width as f64).sqrt();
+    let y = if rows >= n {
+        activation::softmax(q.matmul(k_t) / scale, 3).matmul(v)
+    } else {
+        let mut pieces = Vec::with_capacity(n.div_ceil(rows));
+        for start in (0..n).step_by(rows) {
+            let end = (start + rows).min(n);
+            let scores = q.clone().slice_dim(2, start..end).matmul(k_t.clone()) / scale;
+            pieces.push(activation::softmax(scores, 3).matmul(v.clone()));
+        }
+        Tensor::cat(pieces, 2)
+    };
+    y.permute([0, 2, 1, 3]).reshape([b, n, heads * d])
+}
+
 pub(super) struct Attention {
     q: Linear,
     k: Linear,
     v: Linear,
     out: Linear,
     heads: usize,
+    max_score_elements: usize,
 }
 impl Attention {
     pub fn new(
@@ -214,7 +247,13 @@ impl Attention {
             v: Linear::new(w, &format!("{p}.to_v"), context, width, bias)?,
             out: Linear::new(w, &format!("{p}.to_out.0"), width, width, true)?,
             heads,
+            max_score_elements: MAX_SCORE_ELEMENTS,
         })
+    }
+    #[cfg(test)]
+    pub fn with_score_limit(mut self, elements: usize) -> Self {
+        self.max_score_elements = elements.max(1);
+        self
     }
     pub fn forward(&self, x: Tensor<3>, context: Tensor<3>) -> Tensor<3> {
         let [b, n, c] = x.dims();
@@ -235,25 +274,68 @@ impl Attention {
             .forward(context)
             .reshape([b, tokens, self.heads, d])
             .permute([0, 2, 1, 3]);
-        // Slice the query axis so the quadratic attention score allocation is
-        // bounded even at the largest bridge-validated spatial size.
-        let mut pieces = Vec::with_capacity(n.div_ceil(64));
-        for start in (0..n).step_by(64) {
-            let end = (start + 64).min(n);
-            let scores = q.clone().slice_dim(2, start..end).matmul(k.clone()) / (d as f64).sqrt();
-            pieces.push(activation::softmax(scores, 3).matmul(v.clone()));
-        }
-        let y = Tensor::cat(pieces, 2)
-            .permute([0, 2, 1, 3])
-            .reshape([b, n, c]);
-        self.out.forward(y)
+        self.out
+            .forward(attend(q, k, v, d, self.max_score_elements))
+    }
+}
+
+/// Cross-attention against the bundle's fixed prompt. Keys and values are
+/// computed once at construction; `to_k` and `to_v` weights are released.
+pub(super) struct FixedCrossAttention {
+    q: Linear,
+    k_t: Tensor<4>,
+    v: Tensor<4>,
+    out: Linear,
+    heads: usize,
+}
+impl FixedCrossAttention {
+    pub fn new(
+        w: &mut Weights,
+        p: &str,
+        width: usize,
+        context: &Tensor<3>,
+        heads: usize,
+    ) -> Result<Self> {
+        let [b, tokens, context_width] = context.dims();
+        let d = width / heads;
+        let key = Linear::new(w, &format!("{p}.to_k"), context_width, width, false)?;
+        let value = Linear::new(w, &format!("{p}.to_v"), context_width, width, false)?;
+        Ok(Self {
+            q: Linear::new(w, &format!("{p}.to_q"), width, width, false)?,
+            k_t: key
+                .forward(context.clone())
+                .reshape([b, tokens, heads, d])
+                .permute([0, 2, 3, 1]),
+            v: value
+                .forward(context.clone())
+                .reshape([b, tokens, heads, d])
+                .permute([0, 2, 1, 3]),
+            out: Linear::new(w, &format!("{p}.to_out.0"), width, width, true)?,
+            heads,
+        })
+    }
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let [b, n, c] = x.dims();
+        let d = c / self.heads;
+        let q = self
+            .q
+            .forward(x)
+            .reshape([b, n, self.heads, d])
+            .permute([0, 2, 1, 3]);
+        self.out.forward(attend(
+            q,
+            self.k_t.clone(),
+            self.v.clone(),
+            d,
+            MAX_SCORE_ELEMENTS,
+        ))
     }
 }
 pub(super) struct TransformerBlock {
     norm1: LayerNorm,
     attn1: Attention,
     norm2: LayerNorm,
-    attn2: Attention,
+    attn2: FixedCrossAttention,
     norm3: LayerNorm,
     ff_in: Linear,
     ff_out: Linear,
@@ -264,25 +346,25 @@ impl TransformerBlock {
         w: &mut Weights,
         p: &str,
         width: usize,
-        context: usize,
+        context: &Tensor<3>,
         heads: usize,
     ) -> Result<Self> {
         Ok(Self {
             norm1: LayerNorm::new(w, &format!("{p}.norm1"), width)?,
             attn1: Attention::new(w, &format!("{p}.attn1"), width, width, heads, false)?,
             norm2: LayerNorm::new(w, &format!("{p}.norm2"), width)?,
-            attn2: Attention::new(w, &format!("{p}.attn2"), width, context, heads, false)?,
+            attn2: FixedCrossAttention::new(w, &format!("{p}.attn2"), width, context, heads)?,
             norm3: LayerNorm::new(w, &format!("{p}.norm3"), width)?,
             ff_in: Linear::new(w, &format!("{p}.ff.net.0.proj"), width, width * 8, true)?,
             ff_out: Linear::new(w, &format!("{p}.ff.net.2"), width * 4, width, true)?,
             width,
         })
     }
-    pub fn forward(&self, x: Tensor<3>, context: &Tensor<3>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let n = self.norm1.forward(x.clone());
         let x = x + self.attn1.forward(n.clone(), n);
         let n = self.norm2.forward(x.clone());
-        let x = x + self.attn2.forward(n, context.clone());
+        let x = x + self.attn2.forward(n);
         let ff = self.ff_in.forward(self.norm3.forward(x.clone()));
         let a = ff.clone().slice_dim(2, 0..self.width * 4);
         let gate = ff.slice_dim(2, self.width * 4..self.width * 8);
@@ -300,7 +382,7 @@ impl Transformer {
         w: &mut Weights,
         p: &str,
         width: usize,
-        context: usize,
+        context: &Tensor<3>,
         heads: usize,
         depth: usize,
     ) -> Result<Self> {
@@ -325,7 +407,7 @@ impl Transformer {
             proj_out,
         })
     }
-    pub fn forward(&self, x: Tensor<4>, context: &Tensor<3>) -> Tensor<4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let [b, c, h, w] = x.dims();
         let mut y = self
             .norm
@@ -334,7 +416,7 @@ impl Transformer {
             .swap_dims(1, 2);
         y = self.proj_in.forward(y);
         for block in &self.blocks {
-            y = block.forward(y, context);
+            y = block.forward(y);
         }
         x + self
             .proj_out

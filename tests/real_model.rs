@@ -97,7 +97,7 @@ fn reference(backend: Backend) -> Result<()> {
             diffusion_noise: get("diffusion_noise")?,
         },
         &mut |stage, tensor| {
-            actual.insert(stage.to_owned(), tensor.clone());
+            actual.insert(stage.as_str().to_owned(), tensor.clone());
             Ok(())
         },
     )?;
@@ -164,14 +164,28 @@ fn real_model_missing_critical_weights_fail() -> Result<()> {
     let removed = missing_unet.remove("time_embedding.linear_1.weight");
     assert!(removed.is_some());
     assert!(matches!(
-        NativeModel::new(missing_unet, bundle.vae.clone(), DType::F32, &Device::Cpu),
+        NativeModel::new(
+            missing_unet,
+            bundle.vae.clone(),
+            &bundle.sequence,
+            &bundle.pooled,
+            DType::F32,
+            &Device::Cpu
+        ),
         Err(Error::InvalidArtifact(_))
     ));
     let mut missing_vae = bundle.vae;
     let removed = missing_vae.remove("post_quant_conv.weight");
     assert!(removed.is_some());
     assert!(matches!(
-        NativeModel::new(bundle.unet, missing_vae, DType::F32, &Device::Cpu),
+        NativeModel::new(
+            bundle.unet,
+            missing_vae,
+            &bundle.sequence,
+            &bundle.pooled,
+            DType::F32,
+            &Device::Cpu
+        ),
         Err(Error::InvalidArtifact(_))
     ));
     Ok(())

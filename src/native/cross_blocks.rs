@@ -10,7 +10,6 @@ pub(super) struct CrossConfig {
     pub layers: usize,
     pub channels: usize,
     pub time_dim: usize,
-    pub context: usize,
     pub heads: usize,
     pub depth: usize,
 }
@@ -34,8 +33,8 @@ fn resnet(
     )
 }
 
-fn attention(vs: VarBuilder<'_>, cfg: CrossConfig) -> Result<SpatialTransformer> {
-    SpatialTransformer::new(vs, cfg.channels, cfg.heads, cfg.context, cfg.depth)
+fn attention(vs: VarBuilder<'_>, cfg: CrossConfig, context: &Tensor) -> Result<SpatialTransformer> {
+    SpatialTransformer::new(vs, cfg.channels, cfg.heads, context, cfg.depth)
 }
 
 #[derive(Debug)]
@@ -50,13 +49,14 @@ impl CrossDown {
         input: usize,
         cfg: CrossConfig,
         downsample: bool,
+        context: &Tensor,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let channels = if i == 0 { input } else { cfg.channels };
             layers.push((
                 resnet(vs.pp("resnets").pp(i), channels, cfg.channels, cfg.time_dim)?,
-                attention(vs.pp("attentions").pp(i), cfg)?,
+                attention(vs.pp("attentions").pp(i), cfg, context)?,
             ));
         }
         let downsample = if downsample {
@@ -77,17 +77,12 @@ impl CrossDown {
         Ok(Self { layers, downsample })
     }
 
-    pub fn forward(
-        &self,
-        input: &Tensor,
-        temb: Option<&Tensor>,
-        context: Option<&Tensor>,
-    ) -> Result<(Tensor, Vec<Tensor>)> {
+    pub fn forward(&self, input: &Tensor, temb: Option<&Tensor>) -> Result<(Tensor, Vec<Tensor>)> {
         let mut xs = input.clone();
         let mut saved =
             Vec::with_capacity(self.layers.len() + usize::from(self.downsample.is_some()));
         for (resnet, attention) in &self.layers {
-            xs = attention.forward(&resnet.forward(&xs, temb)?, context)?;
+            xs = attention.forward(&resnet.forward(&xs, temb)?)?;
             saved.push(xs.clone());
         }
         if let Some(conv) = &self.downsample {
@@ -111,6 +106,7 @@ impl CrossUp {
         previous: usize,
         cfg: CrossConfig,
         upsample: bool,
+        context: &Tensor,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
@@ -127,7 +123,7 @@ impl CrossUp {
                     cfg.channels,
                     cfg.time_dim,
                 )?,
-                attention(vs.pp("attentions").pp(i), cfg)?,
+                attention(vs.pp("attentions").pp(i), cfg, context)?,
             ));
         }
         let upsample = if upsample {
@@ -157,7 +153,6 @@ impl CrossUp {
         saved: &[Tensor],
         temb: Option<&Tensor>,
         size: Option<(usize, usize)>,
-        context: Option<&Tensor>,
     ) -> Result<Tensor> {
         if saved.len() != self.layers.len() {
             candle_core::bail!("cross-attention up block received an invalid number of residuals")
@@ -165,7 +160,7 @@ impl CrossUp {
         let mut xs = input.clone();
         for ((resnet, attention), skip) in self.layers.iter().zip(saved.iter().rev()) {
             xs = Tensor::cat(&[&xs, skip], 1)?.contiguous()?;
-            xs = attention.forward(&resnet.forward(&xs, temb)?, context)?;
+            xs = attention.forward(&resnet.forward(&xs, temb)?)?;
         }
         if let Some(conv) = &self.upsample {
             let (height, width) = match size {
@@ -195,21 +190,16 @@ struct MidLayers {
 
 pub(super) struct CrossMid(MidLayers);
 impl CrossMid {
-    pub fn new(vs: VarBuilder<'_>, cfg: CrossConfig) -> Result<Self> {
+    pub fn new(vs: VarBuilder<'_>, cfg: CrossConfig, context: &Tensor) -> Result<Self> {
         Ok(Self(MidLayers {
             initial: resnet(vs.pp("resnets.0"), cfg.channels, cfg.channels, cfg.time_dim)?,
-            attention: attention(vs.pp("attentions.0"), cfg)?,
+            attention: attention(vs.pp("attentions.0"), cfg, context)?,
             final_resnet: resnet(vs.pp("resnets.1"), cfg.channels, cfg.channels, cfg.time_dim)?,
         }))
     }
-    pub fn forward(
-        &self,
-        xs: &Tensor,
-        temb: Option<&Tensor>,
-        context: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
         let xs = self.0.initial.forward(xs, temb)?;
-        let xs = self.0.attention.forward(&xs, context)?;
+        let xs = self.0.attention.forward(&xs)?;
         self.0.final_resnet.forward(&xs, temb)
     }
 }
@@ -248,11 +238,11 @@ mod tests {
                 layers: 2,
                 channels: 64,
                 time_dim: 128,
-                context: 8,
                 heads: 2,
                 depth,
             };
-            let _ = CrossDown::new(a.pp("down"), 32, cfg, true)?;
+            let context = Tensor::zeros((1, 2, 8), DType::F32, device)?;
+            let _ = CrossDown::new(a.pp("down"), 32, cfg, true, &context)?;
             let _ = CrossAttnDownBlock2D::new(
                 b.pp("down"),
                 32,
@@ -273,7 +263,7 @@ mod tests {
                 },
             )?;
             let up_cfg = CrossConfig { layers: 3, ..cfg };
-            let _ = CrossUp::new(a.pp("up"), 32, 64, up_cfg, true)?;
+            let _ = CrossUp::new(a.pp("up"), 32, 64, up_cfg, true, &context)?;
             let _ = CrossAttnUpBlock2D::new(
                 b.pp("up"),
                 32,
@@ -294,7 +284,7 @@ mod tests {
                     ..Default::default()
                 },
             )?;
-            let _ = CrossMid::new(a.pp("mid"), cfg)?;
+            let _ = CrossMid::new(a.pp("mid"), cfg, &context)?;
             let _ = UNetMidBlock2DCrossAttn::new(
                 b.pp("mid"),
                 64,

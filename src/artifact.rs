@@ -594,6 +594,28 @@ fn validate_info(
     Ok(decoded_bytes)
 }
 
+/// Tensors at least this large are hashed on a helper thread while the
+/// tensor is constructed; smaller ones are not worth a thread.
+const PARALLEL_HASH_BYTES: usize = 1024 * 1024;
+
+fn tensor_from_bytes(
+    data: &[u8],
+    source_dtype: DType,
+    shape: &[usize],
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    Ok(if dtype.size_in_bytes() < source_dtype.size_in_bytes() {
+        // Narrow on CPU before upload: avoid transferring the larger source
+        // format and keeping a temporary full-precision GPU allocation.
+        Tensor::from_raw_buffer(data, source_dtype, shape, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)?
+    } else {
+        Tensor::from_raw_buffer(data, source_dtype, shape, device)?.to_dtype(dtype)?
+    })
+}
+
 /// Reads and hashes the exact bytes used for tensors without mmap or pickle.
 pub(crate) fn read_tensors(
     path: &Path,
@@ -694,17 +716,23 @@ pub(crate) fn read_tensors(
             .get_mut(..count)
             .ok_or_else(|| artifact_error("tensor read buffer is shorter than validated size"))?;
         reader.read_exact(data)?;
-        hasher.update(&*data);
+        let data: &[u8] = data;
         let source_dtype = DType::try_from(info.dtype)
             .map_err(|e| artifact_error(format!("unsupported tensor dtype: {e}")))?;
-        let tensor = if dtype.size_in_bytes() < source_dtype.size_in_bytes() {
-            // Narrow on CPU before upload: avoid transferring the larger source
-            // format and keeping a temporary full-precision GPU allocation.
-            Tensor::from_raw_buffer(data, source_dtype, &info.shape, &Device::Cpu)?
-                .to_dtype(dtype)?
-                .to_device(device)?
+        let tensor = if count >= PARALLEL_HASH_BYTES {
+            // Hash and construct from the same immutable bytes concurrently;
+            // the digest still covers exactly the bytes used for the tensor.
+            std::thread::scope(|scope| {
+                let hashing = scope.spawn(|| hasher.update(data));
+                let tensor = tensor_from_bytes(data, source_dtype, &info.shape, device, dtype);
+                hashing
+                    .join()
+                    .map_err(|_| artifact_error("tensor hashing thread failed"))?;
+                tensor
+            })?
         } else {
-            Tensor::from_raw_buffer(data, source_dtype, &info.shape, device)?.to_dtype(dtype)?
+            hasher.update(data);
+            tensor_from_bytes(data, source_dtype, &info.shape, device, dtype)?
         };
         result.insert(name, tensor);
     }
@@ -1155,6 +1183,155 @@ mod tests {
         );
         assert!(
             matches!(result, Err(Error::InvalidArtifact(message)) if message.contains("manifest SHA256 mismatch"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mutated_safetensors_return_errors_without_panicking() -> Result<()> {
+        let dir = ScratchDir::new()?;
+        let path = dir.0.join("mutated.safetensors");
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "block.weight".to_owned(),
+            Tensor::from_slice(&[1_f32, -2., 3., 4., 5., 6.], (2, 3), &Device::Cpu)?,
+        );
+        tensors.insert(
+            "block.bias".to_owned(),
+            Tensor::from_slice(&[0.5_f32, -0.5], 2, &Device::Cpu)?,
+        );
+        let limits = ArtifactLimits::default();
+        let digest = write_tensors(&path, &tensors, &limits)?;
+        let seed = fs::read(&path)?;
+        // Deterministic xorshift64* so failures reproduce.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let index =
+            |value: u64, len: usize| usize::try_from(value % len.max(1) as u64).unwrap_or(0);
+        let mut accepted = 0;
+        for _ in 0..2000 {
+            let mut bytes = seed.clone();
+            match next() % 5 {
+                0 => {
+                    for _ in 0..=(next() % 4) {
+                        let at = index(next(), bytes.len());
+                        if let Some(byte) = bytes.get_mut(at) {
+                            *byte ^= 1 << (next() % 8);
+                        }
+                    }
+                }
+                1 => bytes.truncate(index(next(), bytes.len())),
+                2 => {
+                    let prefix = match next() % 3 {
+                        0 => next(),
+                        1 => next() % 4096,
+                        _ => u64::MAX,
+                    };
+                    if let Some(head) = bytes.get_mut(..8) {
+                        head.copy_from_slice(&prefix.to_le_bytes());
+                    }
+                }
+                3 => {
+                    let header_end = 8 + index(next(), 200);
+                    let at = 8 + index(next(), header_end.saturating_sub(8));
+                    let symbols = b"{}[]\":,0123456789-eE.ab_";
+                    if let (Some(byte), Some(symbol)) =
+                        (bytes.get_mut(at), symbols.get(index(next(), symbols.len())))
+                    {
+                        *byte = *symbol;
+                    }
+                }
+                _ => bytes.extend((0..=(next() % 64)).map(|_| (next() & 0xff) as u8)),
+            }
+            fs::remove_file(&path)?;
+            fs::write(&path, &bytes)?;
+            // Any outcome but a panic is acceptable; a pinned digest must
+            // only accept the unmodified bytes.
+            if let Ok((_, actual)) = read_tensors(
+                &path,
+                &Device::Cpu,
+                DType::F32,
+                &limits,
+                &mut Budget::default(),
+                Some(&digest),
+            ) {
+                assert_eq!(actual, digest);
+                assert_eq!(bytes, seed);
+                accepted += 1;
+            }
+        }
+        assert!(accepted < 2000);
+        Ok(())
+    }
+
+    #[test]
+    fn large_tensors_hash_in_order_with_concurrent_construction() -> Result<()> {
+        let dir = ScratchDir::new()?;
+        let path = dir.0.join("large.safetensors");
+        // Two tensors above the concurrent-hash threshold around a small one,
+        // so ordering across both hashing paths is covered.
+        let elements = PARALLEL_HASH_BYTES / 4 + 3;
+        let large = |phase: f32| -> Result<Tensor> {
+            let values: Vec<f32> = (0..elements).map(|i| i as f32 * 0.5 + phase).collect();
+            Ok(Tensor::from_vec(values, elements, &Device::Cpu)?)
+        };
+        let mut tensors = HashMap::new();
+        tensors.insert("a.weight".to_owned(), large(1.0)?);
+        tensors.insert(
+            "b.bias".to_owned(),
+            Tensor::new(&[7_f32, 8.], &Device::Cpu)?,
+        );
+        tensors.insert("c.weight".to_owned(), large(-3.0)?);
+        let limits = ArtifactLimits::default();
+        let digest = write_tensors(&path, &tensors, &limits)?;
+        let mut file_hasher = Sha256::new();
+        file_hasher.update(fs::read(&path)?);
+        assert_eq!(digest, format!("{:x}", file_hasher.finalize()));
+        let (loaded, actual) = read_tensors(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            &limits,
+            &mut Budget::default(),
+            Some(&digest),
+        )?;
+        assert_eq!(actual, digest);
+        for (name, expected) in &tensors {
+            let loaded = loaded
+                .get(name)
+                .ok_or_else(|| artifact_error("missing test tensor"))?;
+            assert_eq!(loaded.to_vec1::<f32>()?, expected.to_vec1::<f32>()?);
+        }
+        // Change one byte inside the first large tensor's data.
+        let mut bytes = fs::read(&path)?;
+        let header = usize::try_from(u64::from_le_bytes(
+            bytes
+                .get(..8)
+                .and_then(|prefix| prefix.try_into().ok())
+                .ok_or_else(|| artifact_error("short test file"))?,
+        ))
+        .map_err(|_| artifact_error("test header too large"))?;
+        let target = bytes
+            .get_mut(8 + header + 100)
+            .ok_or_else(|| artifact_error("short test file"))?;
+        *target ^= 0x01;
+        fs::remove_file(&path)?;
+        fs::write(&path, &bytes)?;
+        assert!(
+            read_tensors(
+                &path,
+                &Device::Cpu,
+                DType::F32,
+                &limits,
+                &mut Budget::default(),
+                Some(&digest)
+            )
+            .is_err()
         );
         Ok(())
     }

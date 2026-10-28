@@ -10,7 +10,9 @@ use candle_transformers::models::stable_diffusion::{
 };
 
 use super::super::{Weights, acquire_device, guarded, readback, upload};
-use super::layers::{Attention, Conv, GroupNorm, LayerNorm, Linear, TimeEmbedding};
+use super::layers::{
+    Attention, Conv, FixedCrossAttention, GroupNorm, LayerNorm, Linear, TimeEmbedding,
+};
 use crate::Result;
 
 type Checkpoint = HashMap<String, Tensor>;
@@ -234,13 +236,45 @@ fn gpu_checkpoint_attention_matches_candle_across_query_slice() -> Result<()> {
         let context = cpu(values(5 * 3, 6), &[1, 5, 3])?;
         let expected = reference.forward(&query, Some(&context))?;
         let mut weights = weight_map(map, &device);
-        let attention = Attention::new(&mut weights, "attention", 4, 3, 2, false)?;
+        // Force 64-query slices: one batch, two heads and five context tokens.
+        let attention =
+            Attention::new(&mut weights, "attention", 4, 3, 2, false)?.with_score_limit(2 * 5 * 64);
         let actual = attention.forward(
             upload(&query, "attention query", [1, 65, 4], &device)?,
             upload(&context, "attention context", [1, 5, 3], &device)?,
         );
         let actual = readback(actual, [1, 65, 4], "attention")?;
         // A short F32 matmul/softmax chain permits backend rounding, not structural errors.
+        compare(&actual, &expected, 3e-5)
+    })
+}
+
+#[test]
+#[ignore = "requires a real WGPU adapter"]
+fn gpu_fixed_cross_attention_matches_candle_on_the_fly_attention() -> Result<()> {
+    guarded("operator fixed cross-attention test", || {
+        let (device, _) = acquire_device(0)?;
+        let mut map = Checkpoint::new();
+        insert(&mut map, "attention.to_q.weight", &[4, 4], values(16, 1))?;
+        insert(&mut map, "attention.to_k.weight", &[4, 3], values(12, 4))?;
+        insert(&mut map, "attention.to_v.weight", &[4, 3], values(12, 8))?;
+        insert(
+            &mut map,
+            "attention.to_out.0.weight",
+            &[4, 4],
+            values(16, 11),
+        )?;
+        insert(&mut map, "attention.to_out.0.bias", &[4], values(4, 15))?;
+        let vb = VarBuilder::from_tensors(map.clone(), DType::F32, &Device::Cpu);
+        let reference = CrossAttention::new(vb.pp("attention"), 4, Some(3), 2, 2, None, false)?;
+        let query = cpu(values(65 * 4, 2), &[1, 65, 4])?;
+        let context = cpu(values(5 * 3, 6), &[1, 5, 3])?;
+        let expected = reference.forward(&query, Some(&context))?;
+        let mut weights = weight_map(map, &device);
+        let gpu_context = upload(&context, "attention context", [1, 5, 3], &device)?;
+        let attention = FixedCrossAttention::new(&mut weights, "attention", 4, &gpu_context, 2)?;
+        let actual = attention.forward(upload(&query, "attention query", [1, 65, 4], &device)?);
+        let actual = readback(actual, [1, 65, 4], "fixed cross-attention")?;
         compare(&actual, &expected, 3e-5)
     })
 }

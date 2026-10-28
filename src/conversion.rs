@@ -160,9 +160,7 @@ pub fn convert(request: &ConversionRequest) -> Result<Manifest> {
     validate_prompt(&prompt)?;
     // Check the complete fixed graph before publishing, including non-adapted
     // tensors and the full VAE. Tensor clones share their model storage.
-    let validated =
-        crate::native::NativeModel::new(unet.clone(), vae.clone(), DType::F32, &Device::Cpu)?;
-    drop(validated);
+    validate_native_graph(&unet, &vae, &prompt)?;
     manifest.input_sha256 = InputDigests {
         base_unet: unet_hash,
         base_vae: vae_hash,
@@ -203,6 +201,29 @@ pub fn convert(request: &ConversionRequest) -> Result<Manifest> {
     fs::hard_link(&temporary_manifest, request.output_dir.join(MANIFEST_FILE))?;
     let _ = fs::remove_file(temporary_manifest);
     Ok(manifest)
+}
+
+/// Construct the fixed native graph from validated maps, then release it.
+fn validate_native_graph(
+    unet: &HashMap<String, Tensor>,
+    vae: &HashMap<String, Tensor>,
+    prompt: &HashMap<String, Tensor>,
+) -> Result<()> {
+    let prompt_tensor = |name: &str| {
+        prompt
+            .get(name)
+            .ok_or_else(|| artifact_error(format!("missing critical tensor {name}")))
+    };
+    let validated = crate::native::NativeModel::new(
+        unet.clone(),
+        vae.clone(),
+        prompt_tensor("prompt_embeds")?,
+        prompt_tensor("pooled_prompt_embeds")?,
+        DType::F32,
+        &Device::Cpu,
+    )?;
+    drop(validated);
+    Ok(())
 }
 
 fn clean_name(mut name: &str) -> String {

@@ -16,13 +16,14 @@ pub mod tensor_io;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
 
-pub use pipeline::{InferenceInput, InferenceLimits, InferenceResult};
-pub use runtime::{Backend, LoadOptions, Osor};
+pub use pipeline::{InferenceInput, InferenceLimits, InferenceResult, Stage};
+pub use runtime::{Backend, LoadOptions, Osor, OsorBuilder};
 
 pub use candle_core::{DType, Device, Tensor};
 
 /// Errors returned by validation, offline artifact tools, and inference.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("invalid input: {0}")]
     InvalidInput(String),

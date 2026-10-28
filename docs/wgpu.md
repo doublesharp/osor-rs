@@ -18,10 +18,13 @@ encode, UNet forward and VAE decode crosses that boundary once in each direction
 
 Initial admission is F32, batch one, at most 262144 image pixels, axes from 32
 through 1024 in multiples of eight. A 512 by 512 image is supported by these
-limits, as are rectangular images with the same pixel budget. Query-sliced
-attention bounds temporary score buffers. This is a memory policy, not a measured
-performance claim. Applications still own total memory admission and concurrency.
-Reuse a loaded `Osor` for repeated jobs.
+limits, as are rectangular images with the same pixel budget. Attention slices
+query rows only when one score matrix would exceed 64 Mi F32 elements
+(256 MiB); within the current admission bound every UNet and VAE attention
+runs unsliced. Cross-attention keys and values for the bundle's fixed prompt
+are computed once at load, so the `attn2.to_k`/`to_v` weights are released and
+the prompt is no longer uploaded per job. Applications still own total memory
+admission and concurrency. Reuse a loaded `Osor` for repeated jobs.
 
 ```rust,ignore
 let model = osor_rs::Osor::load_with_options(bundle_path, osor_rs::LoadOptions {

@@ -64,7 +64,7 @@ A prepared [model bundle](#model-bundles) is required; the crate does not downlo
 
 ## Use from Rust
 
-Load an `Osor` once with `Osor::load(bundle_path)` and retain it across jobs. Pass the loaded model and your tensors into synchronous inference:
+Load an `Osor` once with `Osor::load(bundle_path)` or `Osor::builder(bundle_path)...load()` and retain it across jobs. A loaded model is `Send + Sync`. Pass it and your tensors into synchronous inference:
 
 ```rust
 use osor_rs::{InferenceInput, InferenceResult, Osor, Result, Tensor};
@@ -94,7 +94,7 @@ Inputs are NCHW tensors on `model.device()`:
 | `posterior_noise` | `[B, 4, H/8, W/8]` | Explicit VAE posterior noise, model dtype |
 | `diffusion_noise` | `[B, 4, H/8, W/8]` | Explicit diffusion noise, model dtype |
 
-Height and width must be multiples of eight in **32..=1024**. CPU and native GPU admission supports batches up to four, subject to the configured total pixel limit. WGPU supports batch one and at most **262,144 pixels**, including rectangular inputs. These bounds do not guarantee that a job fits available memory.
+Height and width must be multiples of eight in **32..=1024**. CPU and native GPU admission supports batches up to four, subject to the configured total pixel limit. WGPU supports batch one and at most **262,144 pixels**, including rectangular inputs. Requested `InferenceLimits` outside 1..=4 images and 1..=4,194,304 batch-inclusive pixels are rejected before any bundle I/O; `Osor::inference_limits()` reports the effective limits after WGPU lowers them. These bounds do not guarantee that a job fits available memory.
 
 Supply independent standard-normal noise tensors for ordinary inference. Preserve their actual values for reproducibility: identical seeds across frameworks do not guarantee identical random tensors.
 
@@ -110,16 +110,33 @@ The image already includes alpha blending **in latent space before decoding**. T
 
 ### Loading and integrity
 
-To select a GPU, call `Osor::load_with_options` and set `LoadOptions::backend` to `Backend::Metal { ordinal: 0 }`, `Backend::Cuda { ordinal: 0 }`, or `Backend::Wgpu { ordinal: 0 }`. Enable the corresponding Cargo feature. An unavailable requested backend returns an error.
+`Osor::builder` collects every load option:
 
-For an application that pins an imported bundle, use `Osor::load_with_options_and_manifest_sha256(bundle_path, options, trusted_manifest_sha256)`. The loader verifies the exact manifest bytes it parses before opening or allocating weight tensors, then verifies tensor bytes against that manifest. Keep the trusted digest from your import or approval step; hashing a replaceable path immediately before loading does not establish a trusted pin. Existing `manifest()`, `device()`, and `dtype()` getters are public. See the [integrity contract](docs/artifacts.md).
+```rust
+use osor_rs::{Backend, Osor, Result, artifact::ArtifactLimits};
 
-Applications with their own admission budget should use `Osor::load_with_options_and_manifest_sha256_and_limits(bundle_path, options, trusted_manifest_sha256, &artifact_limits)`. Set `ArtifactLimits::max_total_tensor_bytes` to the allowed aggregate decoded-weight bytes; F16 inputs loaded as F32 count at the F32 size. Each file's header is checked against the remaining budget before allocating that file's weights. This weight bound does not cover activation, conversion-buffer, allocator-cache, or other process memory, and is not an RSS bound.
+fn load_pinned(bundle: &str, trusted_manifest_sha256: &str) -> Result<Osor> {
+    Osor::builder(bundle)
+        .backend(Backend::Metal { ordinal: 0 })
+        .trusted_manifest_sha256(trusted_manifest_sha256)
+        .artifact_limits(ArtifactLimits {
+            max_total_tensor_bytes: 24 * 1024 * 1024 * 1024,
+            ..ArtifactLimits::default()
+        })
+        .load()
+}
+```
+
+Select `Backend::Metal`, `Backend::Cuda`, or `Backend::Wgpu` and enable the corresponding Cargo feature. An unavailable requested backend returns an error. The earlier `load_with_options`, `load_with_options_and_manifest_sha256`, and `load_with_options_and_manifest_sha256_and_limits` functions remain and behave the same.
+
+A trusted manifest digest pins an imported bundle. The loader verifies the exact manifest bytes it parses before opening or allocating weight tensors, then verifies tensor bytes against that manifest. Keep the trusted digest from your import or approval step; hashing a replaceable path immediately before loading does not establish a trusted pin. The `manifest()`, `device()`, `dtype()`, and `inference_limits()` getters expose the loaded configuration. See the [integrity contract](docs/artifacts.md).
+
+`ArtifactLimits::max_total_tensor_bytes` caps aggregate decoded-weight bytes; F16 inputs loaded as F32 count at the F32 size. Each file's header is checked against the remaining budget before allocating that file's weights. This weight bound does not cover activation, conversion-buffer, allocator-cache, or other process memory, and is not an RSS bound.
 
 ### Jobs and cancellation
 
 - `infer` runs one synchronous job.
-- `infer_with_observer` exposes 18 named intermediate stages. Return `Error::Cancelled` from the observer to cancel between stages; an executing neural layer is synchronous.
+- `infer_with_observer` reports the 18 intermediate stages as typed `Stage` values in order; `Stage::as_str()` gives the pinned capture name. Return `Error::Cancelled` from the observer to cancel between stages; an executing neural layer is synchronous.
 - `infer_profiled` records synchronized stage timings.
 - `preprocess::reference_resize_dimensions` plans the upstream CLI resize dimensions. Image resampling and crop selection remain application responsibilities.
 
@@ -180,6 +197,7 @@ For WGPU, use `--features wgpu` and replace the final `metal` argument with `wgp
 | Backend | Cargo feature | Current boundary |
 |---|---|---|
 | CPU | Default | F32; portable source; macOS real-model execution |
+| CPU + Accelerate | `accelerate` | macOS only; Apple Accelerate matrix products; separately passes both qualification cases |
 | Metal | `metal` | macOS; M2 Max small-case and independent photo acceptance |
 | CUDA | `cuda` | Requires an NVIDIA device, compatible driver, toolkit, and host compiler; device acceptance pending |
 | WGPU | `wgpu` | F32; resident GPU graph with CPU staging; M2 Max small-case and independent photo acceptance |
@@ -192,7 +210,7 @@ WGPU keeps UNet and VAE activations on the GPU, while noise, mask, scheduler, an
 
 The port preserves posterior sampling, 8× max-pooled masks, timestep 400, nine-channel UNet input, added text/time conditioning, five-channel output, scheduler predicted-original computation, and latent alpha blending. See the [numerical contract](docs/reference-contract.md).
 
-On the measured 640×384 photo, warm inference averaged **0.74 s for upstream PyTorch MPS, 5.85 s for Rust Metal, and 20.49 s for Rust WGPU**. These are two-sample, shared-host observations from the optimized Rust development build, with loading excluded. The portable Rust CPU path also needs substantial optimization. See the [performance record](docs/performance.md) for build settings, first/warm timings, memory, and measured bottlenecks; release benchmarking remains open.
+On the measured 640×384 photo, warm inference averaged **0.74 s for upstream PyTorch MPS, 5.98 s for Rust Metal (13.4 GiB peak), and 18.4 s for Rust WGPU**. On the 80×96 input with four threads, Rust CPU averaged **1.69 s** against 1.00 s for PyTorch CPU. These are two-sample, shared-host observations from the `profiling` build, with loading excluded. Metal remains bound by VAE convolution throughput. See the [performance record](docs/performance.md) for first/warm timings, load time, memory, and measured bottlenecks.
 
 <details>
 <summary>Capture, compare, and profile stages</summary>
@@ -211,10 +229,10 @@ scripts/cargo.sh run --locked --bin osor -- compare \
 
 Comparison requires complete matching stage sets and explicit per-stage tolerances. It rejects nonfinite values and exits nonzero on failure. Optional RMS caps supplement the elementwise limits. The [acceptance guide](tests/README.md) describes opt-in real-model tests.
 
-Measure loading, first inference, warm inference, and stage costs with a retained model:
+Measure loading, first inference, warm inference, and stage costs with a retained model. Use the `profiling` profile; dev-profile timings are not representative:
 
 ```sh
-scripts/cargo.sh run --locked --bin osor-profile -- \
+scripts/cargo.sh run --locked --profile profiling --bin osor-profile -- \
   /path/to/bundle /path/to/input.safetensors cpu 3
 ```
 
@@ -228,6 +246,9 @@ scripts/check.sh
 # Optional accelerator source and ordinary-test gates:
 scripts/cargo.sh clippy --locked --all-targets --features metal,wgpu -- -D warnings
 scripts/cargo.sh test --locked --all-targets --features metal,wgpu
+
+# Dependency licenses, sources, bans and advisories (deny.toml):
+cargo deny check
 ```
 
 The wrapper pins Rust 1.95.0, uses sccache when installed, and puts builds and temporary files on `/Volumes/Scratch/osor-rs`. It stops if Scratch is missing on this machine. Set `OSOR_SCRATCH_ROOT` explicitly on other hosts. Normal tests use small synthetic tensors and never download model weights. GPU and full-model tests require explicit local artifacts and opt-in execution.

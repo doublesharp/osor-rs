@@ -1,8 +1,38 @@
-# Performance observations: 2026-10-28
+# Performance observations
 
-The Rust port currently trails the upstream PyTorch implementation on a real photo. These are preliminary engineering measurements on a shared Apple M2 Max with 96 GiB memory, not release benchmarks or a general comparison of programming languages.
+The Rust port still trails upstream PyTorch on Apple GPUs. These are engineering measurements on a shared Apple M2 Max with 96 GiB memory, not release benchmarks or a general comparison of programming languages.
 
-## Same-photo GPU comparison
+## Profiling-build measurements: 2026-10-28 follow-up
+
+Measured with `--profile profiling` (release optimizations plus line tables) after the decoder, banded-convolution, cached cross-attention and overlapped-hashing changes. Same inputs, bundle and captured noise as below; F32, batch one, two warm runs after one first run; loading excluded from inference times. The host was shared (load average 7–30 during runs).
+
+| Implementation | Case | Load | Warm mean | Peak footprint |
+|---|---|---:|---:|---:|
+| Upstream PyTorch 2.7.1 / MPS | 640×384 | — | 0.741 s | 16.1 GiB |
+| Rust / Candle Metal | 640×384 | 7.1 s | 5.98 s | 13.4 GiB |
+| Rust / Burn WGPU | 640×384 | 9.3 s | 18.4 s | 10.5 GiB |
+| Upstream PyTorch 2.7.1 / CPU, 4 threads | 80×96 | — | 1.003 s | — |
+| Rust / Candle CPU, 4 threads | 80×96 | 7.0 s | 1.69 s | 10.0 GiB |
+
+WGPU warm time was the same with `CUBECL_AUTOTUNE_LEVEL=0` (18.2 s). All 18 stages still pass on every backend and both qualification cases; see [qualification](qualification.md).
+
+What changed, measured against the earlier records below:
+
+- **CPU, 21.7 s → 1.7 s warm.** The earlier figure came from the dev profile, whose dependencies kept debug assertions and overflow checks. A plain release build already measured 3.0 s; the cached prompt keys and values cut the UNet stage further (1.08 s → 0.69 s at 80×96). The dev profile now disables dependency assertions.
+- **Metal peak footprint, 30.6 GiB → 13.4 GiB.** Candle lowers each convolution to an im2col buffer that Metal rounds up to a power-of-two allocation; one full-resolution 3×3 decoder convolution needed 2.26 GB (a 4 GiB buffer). VAE convolutions now run in bands of output rows with at most 128 MiB of scratch each. Banding alone measured 15.5 GiB; dropping the cached prompt's `attn2.to_k`/`to_v` weights (about 1.27 GiB F32) accounts for most of the rest.
+- **Metal latency, unchanged (5.85 s → 5.98 s).** Metal is GPU-bound: the whole process used about 5.4 s of CPU time. VAE encode (1.78 s) and decode (3.48 s) remain convolution-throughput bound. Candle 0.11.0 lowers Metal convolutions the same way, so a Candle upgrade alone will not close this gap; a dedicated Metal convolution kernel is the next step.
+- **WGPU, 20.5 s → 18.4 s.** Attention now slices query rows only above a 256 MiB score budget, which never triggers within WGPU admission, and the prompt is no longer uploaded per job. The UNet stage fell from 5.88 s to 4.61 s.
+- **Load, about 9.5 s → 7.1 s (Metal).** SHA-256 of the 10.6 GB bundle costs about 4.5 s of CPU on one core. Tensors of 1 MiB or more are now hashed on a helper thread while the tensor is built from the same bytes.
+
+**Opt-in Apple Accelerate (`--features accelerate`).** On the same 80×96 input with four threads, warm inference averaged 1.16 s (encode 0.18 s, UNet 0.58 s, decode 0.41 s) against 1.69 s for the portable CPU build and 1.00 s for PyTorch CPU. On the 640×384 photo, two warm samples were 49.3 s and 34.0 s under host load average 21; no same-conditions portable CPU photo timing was taken, so no photo speedup is claimed. Accelerate changes CPU accumulation order; it passes all 18 stages on both qualification cases (see [qualification](qualification.md)). The default CPU build is unchanged.
+
+Reproduction data for this section is under `/Volumes/Scratch/osor-rs/reports/review-apply-20261028` (`final-*`, `accelerate-*`, and `kv-cache-*` logs and JSON).
+
+## Earlier development-build measurements
+
+The measurements below predate the follow-up and used the dev profile. They are kept for comparison.
+
+### Same-photo GPU comparison
 
 All runs use the same 640×384 CORNE-Val sample 000001, F32, batch one, identical captured posterior/diffusion noise, and a retained loaded model. Timing synchronizes the selected device and excludes model loading and input/output file I/O. Each process performs one first inference and two warm inferences. Rust additionally measures a separate synchronized stage profile afterward.
 
@@ -16,7 +46,7 @@ The Rust binary is the current optimized development build: crate `opt-level=1`,
 
 The GPU photo benchmarks ran serially, but the host was not reserved or idle. Two warm samples do not establish a latency distribution. A release-build comparison under controlled load remains open.
 
-## Where the time goes
+### Where the time goes
 
 The extra synchronized Rust stage profile on that photo measured:
 
@@ -30,7 +60,7 @@ VAE encoding and decoding account for most measured Metal time and much of WGPU 
 
 Keep a model loaded across jobs. Reloading the full bundle, verifying it, and uploading weights are separate startup costs; avoid paying them for every edit. The new manifest-pinning API preserves byte verification without requiring the application to duplicate the bundle.
 
-## CPU and small inputs
+### CPU and small inputs
 
 On the identical 80×96 F32 input with four requested CPU threads, the latest two-sample warm mean was 1.003 s for PyTorch CPU and 21.732 s for the portable Rust CPU backend. Rust samples ranged from 17.770 to 25.694 s. An earlier same-input Rust measurement ranged from 8.517 to 10.302 s, illustrating substantial shared-host variability. These are observations, not a stable slowdown estimate.
 
@@ -38,7 +68,7 @@ The same small-input GPU means were 0.355 s for PyTorch MPS, 0.300 s for Rust Me
 
 The current portable Candle CPU matrix backend has no Apple Accelerate feature enabled. An optional platform-optimized CPU backend is a concrete optimization candidate; default CPU portability and the existing numerical gates must remain intact. Do not infer a speedup before implementing and measuring it.
 
-## Memory admission
+### Memory admission
 
 `/usr/bin/time -l` reported peak process footprint over model loading, repeated inferences, and Rust's additional stage-profile run:
 
@@ -50,7 +80,7 @@ The current portable Candle CPU matrix backend has no Apple Accelerate feature e
 
 The earlier single Metal inference reached about 20.1 GiB. Retained execution and allocator/kernel caches can increase the peak. These figures are not memory ceilings, GPU-only allocations, or promises for another resolution, batch, machine, or application. Applications must include their other allocations in admission and hold that admission through loading, inference, and output drain.
 
-## Quality priorities
+### Quality priorities
 
 The current F32 implementation passes the named stage-acceptance cases in [qualification](qualification.md). Further quality work should expand those cases to difficult edges, shadows, reflections, and more resolutions; preserve reference RGB/mask preprocessing; and qualify application crop context and effect-region compositing. The returned image already includes latent alpha blending.
 

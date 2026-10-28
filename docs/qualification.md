@@ -44,6 +44,19 @@ All models, inputs, explicit noises, reference captures, comparison reports, mea
 
 The bundle manifest identifies the exact source revisions, licenses, conversion-input hashes, and model-file hashes. The independent dataset is CORNE-Val revision `6d1c6c9bd0822e16bb5293b3d9ef2f6269222baf`; source image/mask hashes and preprocessing are recorded alongside the input. No weights or dataset images are distributed in this repository.
 
+## Review follow-up: 2026-10-28
+
+The follow-up replaced Candle's `AutoEncoderKL` decoder with an owned decoder using the bounded group normalization already used by the encoder, ran VAE convolutions in bands of output rows, computed the fixed prompt's cross-attention keys and values once at load on both native and WGPU graphs, removed WGPU's fixed 64-query attention slicing below a 256 MiB score budget, and overlapped bundle hashing with tensor construction. Every change was rerun against the frozen files above with the `profiling` build:
+
+| Backend | 80×96, `wgpu-f32-tolerances-v1` | 640×384, `full-photo-f32-tolerances-v1` | Photo decoded max / RMS |
+|---|---|---|---|
+| CPU | 18/18 pass | 18/18 pass | 0.00007838 / 0.000002050 |
+| Metal | 18/18 pass | 18/18 pass | 0.00026736 / 0.000002630 |
+| WGPU | 18/18 pass | 18/18 pass | 0.00029010 / 0.000004027 |
+| CPU + `accelerate` | 18/18 pass | 18/18 pass | 0.00017026 / 0.000002482 |
+
+The full-bundle missing-critical-weight test also passes. CPU photo error improved slightly (previously 0.00007898 / 0.000002250); Metal and WGPU photo maxima are unchanged. Focused regressions check that banded convolution is bitwise equal to direct convolution, that cached and self-attention are bitwise equal to Candle's `CrossAttention` for batch one and two, that the owned decoder matches `AutoEncoderKL` within 1e-6 where groups reduce in one pass, and that large-tensor hashing preserves digest order and rejects changed bytes. Nine explicit WGPU device/operator tests pass on the M2 Max, including a new cached cross-attention comparison. Logs are under `/Volumes/Scratch/osor-rs/reports/review-apply-20261028`.
+
 ## Remaining gates
 
 The additive handle-based `conversion::convert_with_io` API reproduced all

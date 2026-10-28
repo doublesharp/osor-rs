@@ -23,7 +23,7 @@ returns canonical named maps. The native model constructor must still validate
 all remaining required model weights. `load_with_limits` accepts explicit
 `ArtifactLimits`; the defaults bound individual files, headers, tensor names,
 shapes, tensor count and aggregate decoded bytes. Tensor bytes are read and
-hashed as a stream, using one reusable bounded read buffer, without mmap. Narrower runtime dtypes are converted on CPU before upload to avoid a larger temporary GPU allocation. The digest verifies the bytes used to create
+hashed as a stream, using one reusable bounded read buffer, without mmap. Tensors of 1 MiB or more are hashed on a helper thread while the tensor is constructed from the same immutable bytes; the digest order and coverage are unchanged. Narrower runtime dtypes are converted on CPU before upload to avoid a larger temporary GPU allocation. The digest verifies the bytes used to create
 the tensors; it does not authenticate an untrusted manifest. Bundle directory
 contents must not be concurrently modified by an untrusted writer. These limits
 bound decoded input sizes, not peak memory: dtype conversion, LoRA merging,

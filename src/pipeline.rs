@@ -3,21 +3,33 @@ use crate::{Error, Result, scheduler::Scheduler};
 use candle_core::{DType, Tensor};
 
 /// Model operations used by the deterministic pipeline.
+///
+/// Backends bind the bundle's fixed prompt and pooled embeddings when they are
+/// constructed; `denoise` receives only per-job inputs.
 pub trait ModelBackend {
     fn encode_moments(&self, image: &Tensor) -> Result<Tensor>;
-    fn denoise(
-        &self,
-        input: &Tensor,
-        timestep: usize,
-        sequence: &Tensor,
-        pooled: &Tensor,
-        time_ids: &Tensor,
-    ) -> Result<Tensor>;
+    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor>;
     fn decode(&self, latents: &Tensor) -> Result<Tensor>;
 }
 
+/// Smallest accepted image height or width.
+pub const MIN_IMAGE_AXIS: usize = 32;
+/// Largest accepted image height or width.
+pub const MAX_IMAGE_AXIS: usize = 1024;
+/// Image height and width must be multiples of the VAE downsampling factor.
+pub const IMAGE_AXIS_MULTIPLE: usize = 8;
+/// Hard batch bound for every backend; backends may admit less.
+pub const MAX_BATCH: usize = 4;
+/// Hard bound on batch-inclusive image pixels; backends may admit less.
+pub const MAX_PIXELS: usize = MAX_BATCH * MAX_IMAGE_AXIS * MAX_IMAGE_AXIS;
+
+/// Whether an image axis is inside the shared admission contract.
+pub(crate) fn valid_image_axis(axis: usize) -> bool {
+    (MIN_IMAGE_AXIS..=MAX_IMAGE_AXIS).contains(&axis) && axis.is_multiple_of(IMAGE_AXIS_MULTIPLE)
+}
+
 /// Limits apply before model execution and include the batch in pixel counts.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InferenceLimits {
     pub max_batch: usize,
     pub max_pixels: usize,
@@ -25,9 +37,22 @@ pub struct InferenceLimits {
 impl Default for InferenceLimits {
     fn default() -> Self {
         Self {
-            max_batch: 4,
-            max_pixels: 4 * 1024 * 1024,
+            max_batch: MAX_BATCH,
+            max_pixels: MAX_PIXELS,
         }
+    }
+}
+impl InferenceLimits {
+    /// Reject limits outside `1..=MAX_BATCH` and `1..=MAX_PIXELS`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_BATCH).contains(&self.max_batch)
+            || !(1..=MAX_PIXELS).contains(&self.max_pixels)
+        {
+            return Err(Error::InvalidInput(format!(
+                "inference limits must have max_batch in 1..={MAX_BATCH} and max_pixels in 1..={MAX_PIXELS}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -59,7 +84,85 @@ pub struct InferenceResult {
     pub latent_alpha: Tensor,
 }
 
-/// Observer receives these stages in order, synchronously, without retaining tensors.
+/// Reference stages, reported to observers in this order, synchronously,
+/// without retaining tensors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Stage {
+    PosteriorMoments,
+    PosteriorMean,
+    PosteriorLogvar,
+    PosteriorSample,
+    OriginalLatent,
+    PooledMask,
+    NoisyLatent,
+    UnetInput,
+    Sequence,
+    Pooled,
+    TimeIds,
+    DenoisingOutput,
+    AlphaLogits,
+    LatentAlpha,
+    PredictedOriginal,
+    BlendedLatent,
+    DecodedImage,
+    Alpha,
+}
+
+impl Stage {
+    /// Every stage in observer order.
+    pub const ALL: [Stage; 18] = [
+        Self::PosteriorMoments,
+        Self::PosteriorMean,
+        Self::PosteriorLogvar,
+        Self::PosteriorSample,
+        Self::OriginalLatent,
+        Self::PooledMask,
+        Self::NoisyLatent,
+        Self::UnetInput,
+        Self::Sequence,
+        Self::Pooled,
+        Self::TimeIds,
+        Self::DenoisingOutput,
+        Self::AlphaLogits,
+        Self::LatentAlpha,
+        Self::PredictedOriginal,
+        Self::BlendedLatent,
+        Self::DecodedImage,
+        Self::Alpha,
+    ];
+
+    /// The pinned stage name used in captures, references and tolerances.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PosteriorMoments => "posterior_moments",
+            Self::PosteriorMean => "posterior_mean",
+            Self::PosteriorLogvar => "posterior_logvar",
+            Self::PosteriorSample => "posterior_sample",
+            Self::OriginalLatent => "original_latent",
+            Self::PooledMask => "pooled_mask",
+            Self::NoisyLatent => "noisy_latent",
+            Self::UnetInput => "unet_input",
+            Self::Sequence => "sequence",
+            Self::Pooled => "pooled",
+            Self::TimeIds => "time_ids",
+            Self::DenoisingOutput => "denoising_output",
+            Self::AlphaLogits => "alpha_logits",
+            Self::LatentAlpha => "latent_alpha",
+            Self::PredictedOriginal => "predicted_original",
+            Self::BlendedLatent => "blended_latent",
+            Self::DecodedImage => "decoded_image",
+            Self::Alpha => "alpha",
+        }
+    }
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Stage names in observer order; identical to `Stage::ALL` names.
 pub const STAGES: &[&str] = &[
     "posterior_moments",
     "posterior_mean",
@@ -121,6 +224,11 @@ fn validate_tensor(
 }
 
 impl<B: ModelBackend> Pipeline<B> {
+    /// Effective admission limits after backend-specific bounds.
+    pub fn limits(&self) -> InferenceLimits {
+        self.config.limits
+    }
+
     pub fn new(
         backend: B,
         scheduler: Scheduler,
@@ -128,16 +236,10 @@ impl<B: ModelBackend> Pipeline<B> {
         pooled: Tensor,
         config: PipelineConfig,
     ) -> Result<Self> {
-        if config.limits.max_batch > 4 || config.limits.max_pixels > 4 * 1024 * 1024 {
-            return Err(Error::InvalidInput(
-                "pipeline limits exceed hard safety bounds".into(),
-            ));
-        }
+        config.limits.validate()?;
         if !config.vae_scaling_factor.is_finite()
             || config.vae_scaling_factor <= 0.0
             || config.timestep >= scheduler.config().num_train_timesteps
-            || config.limits.max_batch == 0
-            || config.limits.max_pixels == 0
         {
             return Err(Error::InvalidInput(
                 "invalid pipeline timestep, scaling factor, or limits".into(),
@@ -163,7 +265,7 @@ impl<B: ModelBackend> Pipeline<B> {
     pub fn infer_with_observer(
         &self,
         input: InferenceInput<'_>,
-        observer: &mut dyn FnMut(&str, &Tensor) -> Result<()>,
+        observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
     ) -> Result<InferenceResult> {
         let (batch, channels, height, width) = input
             .image
@@ -177,14 +279,12 @@ impl<B: ModelBackend> Pipeline<B> {
             || batch > self.config.limits.max_batch
             || pixels > self.config.limits.max_pixels
             || channels != 3
-            || height < 32
-            || width < 32
-            || height > 1024
-            || width > 1024
-            || !height.is_multiple_of(8)
-            || !width.is_multiple_of(8)
+            || !valid_image_axis(height)
+            || !valid_image_axis(width)
         {
-            return Err(Error::InvalidInput("image dimensions or batch exceed limits; H and W must be multiples of 8 in 32..=1024".into()));
+            return Err(Error::InvalidInput(format!(
+                "image dimensions or batch exceed limits; H and W must be multiples of {IMAGE_AXIS_MULTIPLE} in {MIN_IMAGE_AXIS}..={MAX_IMAGE_AXIS}"
+            )));
         }
         // Also bound intermediate channel multiplications before asking a backend to allocate.
         pixels
@@ -235,11 +335,11 @@ impl<B: ModelBackend> Pipeline<B> {
             device,
             None,
         )?;
-        observer("posterior_moments", &moments)?;
+        observer(Stage::PosteriorMoments, &moments)?;
         let mean = moments.narrow(1, 0, 4)?;
         let logvar = moments.narrow(1, 4, 4)?.clamp(-30.0, 20.0)?;
-        observer("posterior_mean", &mean)?;
-        observer("posterior_logvar", &logvar)?;
+        observer(Stage::PosteriorMean, &mean)?;
+        observer(Stage::PosteriorLogvar, &logvar)?;
         let sample = (&mean + &(logvar.affine(0.5, 0.0)?.exp()? * input.posterior_noise)?)?;
         validate_tensor(
             &sample,
@@ -249,7 +349,7 @@ impl<B: ModelBackend> Pipeline<B> {
             device,
             None,
         )?;
-        observer("posterior_sample", &sample)?;
+        observer(Stage::PosteriorSample, &sample)?;
         let original = sample.affine(self.config.vae_scaling_factor, 0.0)?;
         validate_tensor(
             &original,
@@ -259,16 +359,16 @@ impl<B: ModelBackend> Pipeline<B> {
             device,
             None,
         )?;
-        observer("original_latent", &original)?;
+        observer(Stage::OriginalLatent, &original)?;
         let mask = input.mask.max_pool2d(8)?.to_dtype(dtype)?;
-        observer("pooled_mask", &mask)?;
+        observer(Stage::PooledMask, &mask)?;
         let noisy =
             self.scheduler
                 .add_noise(&original, input.diffusion_noise, self.config.timestep)?;
         validate_tensor(&noisy, "noisy latent", &latent_shape, dtype, device, None)?;
-        observer("noisy_latent", &noisy)?;
+        observer(Stage::NoisyLatent, &noisy)?;
         let unet_input = Tensor::cat(&[&noisy, &mask, &original], 1)?;
-        observer("unet_input", &unet_input)?;
+        observer(Stage::UnetInput, &unet_input)?;
         let sequence = if batch == 1 {
             self.sequence.clone()
         } else {
@@ -297,12 +397,12 @@ impl<B: ModelBackend> Pipeline<B> {
         } else {
             ids.repeat((batch, 1))?
         };
-        observer("sequence", &sequence)?;
-        observer("pooled", &pooled)?;
-        observer("time_ids", &ids)?;
-        let output =
-            self.backend
-                .denoise(&unet_input, self.config.timestep, &sequence, &pooled, &ids)?;
+        observer(Stage::Sequence, &sequence)?;
+        observer(Stage::Pooled, &pooled)?;
+        observer(Stage::TimeIds, &ids)?;
+        let output = self
+            .backend
+            .denoise(&unet_input, self.config.timestep, &ids)?;
         validate_tensor(
             &output,
             "denoiser output",
@@ -313,10 +413,10 @@ impl<B: ModelBackend> Pipeline<B> {
         )?;
         let denoising = output.narrow(1, 0, 4)?;
         let logits = output.narrow(1, 4, 1)?;
-        observer("denoising_output", &denoising)?;
-        observer("alpha_logits", &logits)?;
+        observer(Stage::DenoisingOutput, &denoising)?;
+        observer(Stage::AlphaLogits, &logits)?;
         let latent_alpha = candle_nn::ops::sigmoid(&logits)?;
-        observer("latent_alpha", &latent_alpha)?;
+        observer(Stage::LatentAlpha, &latent_alpha)?;
         let predicted =
             self.scheduler
                 .predicted_original_sample(&noisy, &denoising, self.config.timestep)?;
@@ -328,11 +428,11 @@ impl<B: ModelBackend> Pipeline<B> {
             device,
             None,
         )?;
-        observer("predicted_original", &predicted)?;
+        observer(Stage::PredictedOriginal, &predicted)?;
         let blend = (latent_alpha.broadcast_mul(&predicted)?
             + latent_alpha.affine(-1.0, 1.0)?.broadcast_mul(&original)?)?;
         validate_tensor(&blend, "blended latent", &latent_shape, dtype, device, None)?;
-        observer("blended_latent", &blend)?;
+        observer(Stage::BlendedLatent, &blend)?;
         let decoded = self
             .backend
             .decode(&blend.affine(1.0 / self.config.vae_scaling_factor, 0.0)?)?;
@@ -350,9 +450,9 @@ impl<B: ModelBackend> Pipeline<B> {
             .to_dtype(DType::F32)?
             .affine(0.5, 0.5)?
             .clamp(0.0, 1.0)?;
-        observer("decoded_image", &image)?;
+        observer(Stage::DecodedImage, &image)?;
         let alpha = bilinear_8x(&latent_alpha.to_dtype(DType::F32)?, height, width)?;
-        observer("alpha", &alpha)?;
+        observer(Stage::Alpha, &alpha)?;
         Ok(InferenceResult {
             image,
             alpha,
@@ -410,7 +510,7 @@ mod tests {
     #[derive(Default)]
     struct Synthetic {
         decoded: RefCell<Option<Tensor>>,
-        conditioning: RefCell<Option<(Tensor, Tensor, Tensor)>>,
+        time_ids: RefCell<Option<Tensor>>,
         encodes: Cell<usize>,
     }
     impl ModelBackend for Synthetic {
@@ -421,17 +521,9 @@ mod tests {
             let logvar = Tensor::zeros((b, 4, h / 8, w / 8), DType::F32, image.device())?;
             Ok(Tensor::cat(&[&mean, &logvar], 1)?)
         }
-        fn denoise(
-            &self,
-            input: &Tensor,
-            timestep: usize,
-            sequence: &Tensor,
-            pooled: &Tensor,
-            time_ids: &Tensor,
-        ) -> Result<Tensor> {
+        fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
             assert_eq!(timestep, 0);
-            *self.conditioning.borrow_mut() =
-                Some((sequence.clone(), pooled.clone(), time_ids.clone()));
+            *self.time_ids.borrow_mut() = Some(time_ids.clone());
             let (b, c, h, w) = input.dims4()?;
             assert_eq!(c, 9);
             let eps = Tensor::full(0.5f32, (b, 4, h, w), input.device())?;
@@ -488,14 +580,7 @@ mod tests {
                     image.device(),
                 )?)
             }
-            fn denoise(
-                &self,
-                input: &Tensor,
-                _: usize,
-                _: &Tensor,
-                _: &Tensor,
-                _: &Tensor,
-            ) -> Result<Tensor> {
+            fn denoise(&self, input: &Tensor, _: usize, _: &Tensor) -> Result<Tensor> {
                 let (b, _, h, w) = input.dims4()?;
                 Ok(Tensor::zeros((b, 5, h, w), DType::BF16, input.device())?)
             }
@@ -543,6 +628,7 @@ mod tests {
         let posterior = Tensor::ones((2, 4, 4, 4), DType::F32, &Device::Cpu)?;
         let diffusion = Tensor::full(2f32, (2, 4, 4, 4), &Device::Cpu)?;
         let mut stages = Vec::new();
+        let mut conditioning = Vec::new();
         let result = p.infer_with_observer(
             InferenceInput {
                 image: &image,
@@ -550,20 +636,29 @@ mod tests {
                 posterior_noise: &posterior,
                 diffusion_noise: &diffusion,
             },
-            &mut |name, t| {
-                stages.push(name.to_owned());
-                match name {
-                    "posterior_sample" => close(first(t)?, 3.0),
-                    "pooled_mask" => close(first(t)?, 1.0),
-                    "noisy_latent" => close(first(t)?, 3.6),
-                    "predicted_original" => close(first(t)?, 4.125),
-                    "blended_latent" => close(first(t)?, 3.5625),
+            &mut |stage, t| {
+                stages.push(stage);
+                if matches!(stage, Stage::Sequence | Stage::Pooled) {
+                    conditioning.push(t.dims().to_vec());
+                }
+                match stage {
+                    Stage::PosteriorSample => close(first(t)?, 3.0),
+                    Stage::PooledMask => close(first(t)?, 1.0),
+                    Stage::NoisyLatent => close(first(t)?, 3.6),
+                    Stage::PredictedOriginal => close(first(t)?, 4.125),
+                    Stage::BlendedLatent => close(first(t)?, 3.5625),
                     _ => {}
                 }
                 Ok(())
             },
         )?;
-        assert!(stages.iter().map(String::as_str).eq(STAGES.iter().copied()));
+        assert_eq!(stages, Stage::ALL);
+        assert!(
+            Stage::ALL
+                .iter()
+                .map(|stage| stage.as_str())
+                .eq(STAGES.iter().copied())
+        );
         close(first(&result.latent_alpha)?, 0.5);
         close(first(&result.alpha)?, 0.5);
         close(first(&result.image)?, 1.0);
@@ -576,17 +671,16 @@ mod tests {
             )?,
             3.5625,
         );
-        let conditioning = p.backend.conditioning.borrow();
-        let (sequence, pooled, ids) = conditioning
+        assert_eq!(conditioning, vec![vec![2, 77, 2048], vec![2, 1280]]);
+        let time_ids = p.backend.time_ids.borrow();
+        let ids = time_ids
             .as_ref()
-            .ok_or_else(|| Error::InvalidInput("conditioning missing".into()))?;
-        assert_eq!(sequence.dims(), &[2, 77, 2048]);
-        assert_eq!(pooled.dims(), &[2, 1280]);
+            .ok_or_else(|| Error::InvalidInput("time IDs missing".into()))?;
         assert_eq!(
             ids.to_vec2::<f32>()?,
             vec![vec![32., 32., 0., 0., 32., 32.]; 2]
         );
-        drop(conditioning);
+        drop(time_ids);
         drop(decoded);
         let zero = Tensor::zeros((2, 4, 4, 4), DType::F32, &Device::Cpu)?;
         p.infer(InferenceInput {
@@ -707,15 +801,15 @@ mod tests {
         assert_eq!(result.image.dims(), &[1, 3, 40, 56]);
         assert_eq!(result.latent_alpha.dims(), &[1, 1, 5, 7]);
         assert_eq!(p.backend.encodes.get(), 1);
-        let conditioning = p.backend.conditioning.borrow();
-        let (_, _, ids) = conditioning
+        let time_ids = p.backend.time_ids.borrow();
+        let ids = time_ids
             .as_ref()
-            .ok_or_else(|| Error::InvalidInput("conditioning missing".into()))?;
+            .ok_or_else(|| Error::InvalidInput("time IDs missing".into()))?;
         assert_eq!(
             ids.to_vec2::<f32>()?,
             vec![vec![40., 56., 0., 0., 40., 56.]]
         );
-        drop(conditioning);
+        drop(time_ids);
 
         for (height, width) in [(1032, 32), (32, 1032), (31, 32), (32, 41)] {
             let invalid = Tensor::zeros((1, 3, height, width), DType::F32, &Device::Cpu)?;

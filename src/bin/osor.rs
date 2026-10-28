@@ -147,12 +147,12 @@ fn run(args: Vec<OsString>) -> Result<()> {
                 model.device().synchronize()?;
                 let now = Instant::now();
                 timings.push(osor_rs::runtime::StageTiming {
-                    stage: stage.into(),
+                    stage: stage.as_str().into(),
                     elapsed_ms: now.duration_since(previous).as_secs_f64() * 1000.0,
                 });
                 previous = now;
                 if args.len() == 6 {
-                    stages.insert(stage.to_owned(), tensor.clone());
+                    stages.insert(stage.as_str().to_owned(), tensor.clone());
                 }
                 Ok(())
             })?;

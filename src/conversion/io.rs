@@ -249,9 +249,7 @@ pub fn convert_with_io<S: ConversionSink>(
     }
     validate_prompt(&prompt)?;
     checkpoint(ConversionEvent::ValidatingModel)?;
-    let validated =
-        crate::native::NativeModel::new(unet.clone(), vae.clone(), DType::F32, &Device::Cpu)?;
-    drop(validated);
+    super::validate_native_graph(&unet, &vae, &prompt)?;
     checkpoint(ConversionEvent::ModelValidated)?;
     publish_validated_maps(
         manifest,

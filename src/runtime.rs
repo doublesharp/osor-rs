@@ -1,6 +1,6 @@
 //! Application-facing model ownership and explicit backend selection.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
@@ -11,12 +11,14 @@ use crate::{
     native::NativeModel,
     pipeline::{
         InferenceInput, InferenceLimits, InferenceResult, ModelBackend, Pipeline, PipelineConfig,
+        Stage,
     },
     scheduler::Scheduler,
 };
 
 /// Devices are explicit: selecting an unavailable accelerator returns an error.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub enum Backend {
     #[default]
     Cpu,
@@ -100,18 +102,11 @@ impl ModelBackend for RuntimeModel {
         }
     }
 
-    fn denoise(
-        &self,
-        input: &Tensor,
-        timestep: usize,
-        sequence: &Tensor,
-        pooled: &Tensor,
-        time_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Native(model) => model.denoise(input, timestep, sequence, pooled, time_ids),
+            Self::Native(model) => model.denoise(input, timestep, time_ids),
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(model) => model.denoise(input, timestep, sequence, pooled, time_ids),
+            Self::Wgpu(model) => model.denoise(input, timestep, time_ids),
         }
     }
 
@@ -166,7 +161,83 @@ pub struct InferenceProfile {
     pub stages: Vec<StageTiming>,
 }
 
+/// Configures and loads an [`Osor`]; created by [`Osor::builder`].
+///
+/// ```no_run
+/// # fn main() -> osor_rs::Result<()> {
+/// use osor_rs::{Backend, Osor};
+///
+/// let model = Osor::builder("/path/to/bundle")
+///     .backend(Backend::Cpu)
+///     .trusted_manifest_sha256("75324653945a3c74b69fdfd2bde8b852e858bae461a3d9992ce48168c6987a0f")
+///     .load()?;
+/// # let _ = model;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+#[must_use = "call `load` to read the bundle"]
+pub struct OsorBuilder {
+    path: PathBuf,
+    options: LoadOptions,
+    manifest_sha256: Option<String>,
+    artifact_limits: ArtifactLimits,
+}
+
+impl OsorBuilder {
+    /// Compute backend; defaults to CPU.
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.options.backend = backend;
+        self
+    }
+
+    /// Model dtype; defaults to F32. CPU and WGPU require F32.
+    pub fn dtype(mut self, dtype: DType) -> Self {
+        self.options.dtype = dtype;
+        self
+    }
+
+    /// Requested job admission limits, validated before any bundle I/O.
+    pub fn inference_limits(mut self, limits: InferenceLimits) -> Self {
+        self.options.limits = limits;
+        self
+    }
+
+    /// Require the exact manifest bytes to match a SHA-256 retained from a
+    /// trusted import, checked before any weight file is opened.
+    pub fn trusted_manifest_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.manifest_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Artifact admission limits, including the aggregate decoded-weight cap.
+    pub fn artifact_limits(mut self, limits: ArtifactLimits) -> Self {
+        self.artifact_limits = limits;
+        self
+    }
+
+    /// Validate options, then read, verify and load the bundle.
+    pub fn load(self) -> Result<Osor> {
+        Osor::load_internal(
+            &self.path,
+            self.options,
+            self.manifest_sha256.as_deref(),
+            &self.artifact_limits,
+        )
+    }
+}
+
 impl Osor {
+    /// Start configuring a load of the bundle directory at `path`.
+    pub fn builder(path: impl Into<PathBuf>) -> OsorBuilder {
+        OsorBuilder {
+            path: path.into(),
+            options: LoadOptions::default(),
+            manifest_sha256: None,
+            artifact_limits: ArtifactLimits::default(),
+        }
+    }
+
     /// Load a pinned bundle with caller-specified artifact limits.
     /// The aggregate tensor limit counts decoded bytes in the selected dtype,
     /// not peak memory use.
@@ -224,15 +295,8 @@ impl Osor {
                 "CPU and WGPU inference currently require F32".into(),
             ));
         }
-        if options.limits.max_batch == 0
-            || options.limits.max_batch > 16
-            || options.limits.max_pixels == 0
-            || options.limits.max_pixels > 16 * 1024 * 1024
-        {
-            return Err(Error::InvalidInput(
-                "invalid inference admission limits".into(),
-            ));
-        }
+        // Reject before reading or hashing any bundle bytes.
+        options.limits.validate()?;
         let device = options.backend.device()?;
         let bundle = match manifest_sha256 {
             Some(hash) => ModelBundle::load_with_limits_and_manifest_sha256(
@@ -244,16 +308,24 @@ impl Osor {
             )?,
             None => ModelBundle::load_with_limits(path, &device, options.dtype, artifact_limits)?,
         };
-        let mut limits = options.limits;
-        let (model, compute_device) = match options.backend {
+        let (model, compute_device, limits) = match options.backend {
             Backend::Wgpu { ordinal } => {
                 #[cfg(feature = "wgpu")]
                 {
-                    limits.max_batch = limits.max_batch.min(1);
-                    limits.max_pixels = limits.max_pixels.min(512 * 512);
-                    let model = crate::wgpu::WgpuModel::new(bundle.unet, bundle.vae, ordinal)?;
+                    // WGPU admits less than the shared bound; see `Osor::inference_limits`.
+                    let limits = InferenceLimits {
+                        max_batch: options.limits.max_batch.min(1),
+                        max_pixels: options.limits.max_pixels.min(crate::wgpu::MAX_PIXELS),
+                    };
+                    let model = crate::wgpu::WgpuModel::new(
+                        bundle.unet,
+                        bundle.vae,
+                        &bundle.sequence,
+                        &bundle.pooled,
+                        ordinal,
+                    )?;
                     let description = model.device_description();
-                    (RuntimeModel::Wgpu(Box::new(model)), description)
+                    (RuntimeModel::Wgpu(Box::new(model)), description, limits)
                 }
                 #[cfg(not(feature = "wgpu"))]
                 {
@@ -263,18 +335,18 @@ impl Osor {
                     ));
                 }
             }
-            _ => {
-                limits.max_batch = limits.max_batch.min(4);
-                (
-                    RuntimeModel::Native(Box::new(NativeModel::new(
-                        bundle.unet,
-                        bundle.vae,
-                        options.dtype,
-                        &device,
-                    )?)),
-                    format!("{:?}", options.backend),
-                )
-            }
+            _ => (
+                RuntimeModel::Native(Box::new(NativeModel::new(
+                    bundle.unet,
+                    bundle.vae,
+                    &bundle.sequence,
+                    &bundle.pooled,
+                    options.dtype,
+                    &device,
+                )?)),
+                format!("{:?}", options.backend),
+                options.limits,
+            ),
         };
         let scheduler = Scheduler::new(bundle.manifest.scheduler.clone())?;
         let config = PipelineConfig {
@@ -314,6 +386,12 @@ impl Osor {
         self.dtype
     }
 
+    /// Effective admission limits. WGPU lowers requested limits to batch one
+    /// and its own pixel bound; other backends use the requested limits.
+    pub fn inference_limits(&self) -> InferenceLimits {
+        self.pipeline.limits()
+    }
+
     /// Return the full decoded image and predicted edit alpha. Effects may extend
     /// beyond the supplied removal mask; there is no implicit RGB paste-back.
     pub fn infer(&self, input: InferenceInput<'_>) -> Result<InferenceResult> {
@@ -323,7 +401,7 @@ impl Osor {
     pub fn infer_with_observer(
         &self,
         input: InferenceInput<'_>,
-        observer: &mut dyn FnMut(&str, &Tensor) -> Result<()>,
+        observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
     ) -> Result<InferenceResult> {
         self.pipeline.infer_with_observer(input, observer)
     }
@@ -342,7 +420,7 @@ impl Osor {
             self.device.synchronize()?;
             let now = Instant::now();
             stages.push(StageTiming {
-                stage: stage.into(),
+                stage: stage.as_str().into(),
                 elapsed_ms: now.duration_since(previous).as_secs_f64() * 1000.0,
             });
             previous = now;
@@ -364,15 +442,8 @@ impl ModelBackend for NativeModel {
         NativeModel::encode_moments(self, image)
     }
 
-    fn denoise(
-        &self,
-        input: &Tensor,
-        timestep: usize,
-        sequence: &Tensor,
-        pooled: &Tensor,
-        time_ids: &Tensor,
-    ) -> Result<Tensor> {
-        NativeModel::denoise(self, input, timestep, sequence, pooled, time_ids)
+    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+        NativeModel::denoise(self, input, timestep, time_ids)
     }
 
     fn decode(&self, latents: &Tensor) -> Result<Tensor> {
@@ -403,6 +474,66 @@ mod tests {
             Err(Error::Unavailable(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn builder_validates_options_and_pin_before_bundle_io() {
+        assert!(matches!(
+            Osor::builder("missing-model").dtype(DType::BF16).load(),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            Osor::builder("missing-model")
+                .inference_limits(InferenceLimits {
+                    max_batch: 5,
+                    max_pixels: 1024,
+                })
+                .load(),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            Osor::builder("missing-model")
+                .trusted_manifest_sha256("bad")
+                .load(),
+            Err(Error::InvalidArtifact(message)) if message.contains("64 hexadecimal")
+        ));
+    }
+
+    #[test]
+    fn loaded_models_can_be_shared_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Osor>();
+    }
+
+    #[test]
+    fn out_of_range_limits_fail_before_bundle_io() {
+        for limits in [
+            InferenceLimits {
+                max_batch: 5,
+                max_pixels: 1024,
+            },
+            InferenceLimits {
+                max_batch: 1,
+                max_pixels: crate::pipeline::MAX_PIXELS + 1,
+            },
+            InferenceLimits {
+                max_batch: 0,
+                max_pixels: 1024,
+            },
+        ] {
+            // A missing bundle would report an I/O or artifact error if loading began.
+            let result = Osor::load_with_options(
+                "missing-model",
+                LoadOptions {
+                    limits,
+                    ..LoadOptions::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidInput(_))),
+                "limits {limits:?} were not rejected before bundle I/O"
+            );
+        }
     }
 
     #[test]

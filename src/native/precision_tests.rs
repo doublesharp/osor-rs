@@ -8,7 +8,7 @@ use std::{
 
 use candle_nn::Module;
 
-use super::{Architecture, AutoEncoderKL, AutoEncoderKLConfig, VaeEncoder, VarBuilder};
+use super::{Architecture, VaeDecoder, VaeEncoder, VarBuilder};
 use crate::{
     DType, Device, Error, Result, Tensor,
     artifact::{
@@ -175,20 +175,8 @@ fn vae_cpu_same_input_reference() -> Result<()> {
     let vae = if encoder_only {
         None
     } else {
-        // Keep this configuration identical to NativeModel::build.
-        Some(AutoEncoderKL::new(
-            vs,
-            3,
-            3,
-            AutoEncoderKLConfig {
-                block_out_channels: arch.vae_channels.to_vec(),
-                layers_per_block: arch.vae_layers,
-                latent_channels: 4,
-                norm_num_groups: 32,
-                use_quant_conv: true,
-                use_post_quant_conv: true,
-            },
-        )?)
+        // Keep this construction identical to NativeModel::build.
+        Some(VaeDecoder::new(vs, &arch)?)
     };
     // The image is already normalized to [-1, 1]; the latent is already unscaled.
     let moments = if let Some(output) = std::env::var_os("OSOR_VAE_TRACE_CAPTURE") {
@@ -198,7 +186,7 @@ fn vae_cpu_same_input_reference() -> Result<()> {
     };
     let mut actual = HashMap::from([("posterior_moments".into(), moments)]);
     if let Some(vae) = vae {
-        actual.insert("decoded_raw".into(), vae.decode(latent)?);
+        actual.insert("decoded_raw".into(), vae.forward(latent)?);
     }
     let reports = if encoder_only {
         let moments_reference = input(&expected, "posterior_moments")?.clone();

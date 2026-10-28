@@ -4,6 +4,7 @@ use candle_core::{D, DType, Tensor};
 use candle_nn::{self as nn, Module, VarBuilder};
 
 use super::Architecture;
+use super::conv::{BandedConv2d, conv2d};
 use crate::Result;
 
 const GROUPS: usize = 32;
@@ -36,7 +37,7 @@ pub(super) struct StableGroupNorm {
 }
 
 impl StableGroupNorm {
-    fn new(channels: usize, vs: VarBuilder<'_>) -> candle_core::Result<Self> {
+    pub(super) fn new(channels: usize, vs: VarBuilder<'_>) -> candle_core::Result<Self> {
         if channels == 0 || !channels.is_multiple_of(GROUPS) {
             candle_core::bail!("VAE group normalization requires channels divisible by 32")
         }
@@ -78,40 +79,34 @@ impl Module for StableGroupNorm {
     }
 }
 
-struct Resnet {
+pub(super) struct Resnet {
     norm1: StableGroupNorm,
-    conv1: nn::Conv2d,
+    conv1: BandedConv2d,
     norm2: StableGroupNorm,
-    conv2: nn::Conv2d,
-    shortcut: Option<nn::Conv2d>,
+    conv2: BandedConv2d,
+    shortcut: Option<BandedConv2d>,
 }
 
 impl Resnet {
-    fn new(vs: VarBuilder<'_>, input: usize, output: usize) -> candle_core::Result<Self> {
-        let cfg = nn::Conv2dConfig {
-            padding: 1,
-            ..Default::default()
-        };
+    pub(super) fn new(
+        vs: VarBuilder<'_>,
+        input: usize,
+        output: usize,
+    ) -> candle_core::Result<Self> {
         Ok(Self {
             norm1: StableGroupNorm::new(input, vs.pp("norm1"))?,
-            conv1: nn::conv2d(input, output, 3, cfg, vs.pp("conv1"))?,
+            conv1: conv2d(input, output, 3, 1, 1, vs.pp("conv1"))?,
             norm2: StableGroupNorm::new(output, vs.pp("norm2"))?,
-            conv2: nn::conv2d(output, output, 3, cfg, vs.pp("conv2"))?,
+            conv2: conv2d(output, output, 3, 1, 1, vs.pp("conv2"))?,
             shortcut: if input == output {
                 None
             } else {
-                Some(nn::conv2d(
-                    input,
-                    output,
-                    1,
-                    Default::default(),
-                    vs.pp("conv_shortcut"),
-                )?)
+                Some(conv2d(input, output, 1, 1, 0, vs.pp("conv_shortcut"))?)
             },
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
         let shortcut = match &self.shortcut {
             Some(conv) => conv.forward(xs)?,
             None => xs.clone(),
@@ -128,7 +123,7 @@ impl Resnet {
 
 pub(super) struct DownBlock {
     resnets: Vec<Resnet>,
-    downsample: Option<nn::Conv2d>,
+    downsample: Option<BandedConv2d>,
 }
 
 impl DownBlock {
@@ -148,15 +143,12 @@ impl DownBlock {
             )?);
         }
         let downsample = if downsample {
-            let cfg = nn::Conv2dConfig {
-                stride: 2,
-                ..Default::default()
-            };
-            Some(nn::conv2d(
+            Some(conv2d(
                 output,
                 output,
                 3,
-                cfg,
+                2,
+                0,
                 vs.pp("downsamplers").pp(0).pp("conv"),
             )?)
         } else {
@@ -271,7 +263,7 @@ pub(super) struct MidBlock {
 }
 
 impl MidBlock {
-    fn new(vs: VarBuilder<'_>, channels: usize) -> candle_core::Result<Self> {
+    pub(super) fn new(vs: VarBuilder<'_>, channels: usize) -> candle_core::Result<Self> {
         Ok(Self {
             first: Resnet::new(vs.pp("resnets").pp(0), channels, channels)?,
             attention: Attention::new(vs.pp("attentions").pp(0), channels)?,
@@ -290,23 +282,19 @@ impl MidBlock {
 }
 
 pub(super) struct VaeEncoder {
-    pub(super) conv_in: nn::Conv2d,
+    pub(super) conv_in: BandedConv2d,
     pub(super) down: Vec<DownBlock>,
     pub(super) mid: MidBlock,
     pub(super) norm_out: StableGroupNorm,
-    pub(super) conv_out: nn::Conv2d,
-    pub(super) quant_conv: nn::Conv2d,
+    pub(super) conv_out: BandedConv2d,
+    pub(super) quant_conv: BandedConv2d,
 }
 
 impl VaeEncoder {
     pub(super) fn new(vs: VarBuilder<'_>, arch: &Architecture) -> candle_core::Result<Self> {
         let channels = arch.vae_channels;
         let enc = vs.pp("encoder");
-        let cfg = nn::Conv2dConfig {
-            padding: 1,
-            ..Default::default()
-        };
-        let conv_in = nn::conv2d(3, channels[0], 3, cfg, enc.pp("conv_in"))?;
+        let conv_in = conv2d(3, channels[0], 3, 1, 1, enc.pp("conv_in"))?;
         let mut down = Vec::with_capacity(channels.len());
         for (i, &output) in channels.iter().enumerate() {
             let input = if i == 0 { channels[0] } else { channels[i - 1] };
@@ -324,8 +312,8 @@ impl VaeEncoder {
             down,
             mid: MidBlock::new(enc.pp("mid_block"), last)?,
             norm_out: StableGroupNorm::new(last, enc.pp("conv_norm_out"))?,
-            conv_out: nn::conv2d(last, 8, 3, cfg, enc.pp("conv_out"))?,
-            quant_conv: nn::conv2d(8, 8, 1, Default::default(), vs.pp("quant_conv"))?,
+            conv_out: conv2d(last, 8, 3, 1, 1, enc.pp("conv_out"))?,
+            quant_conv: conv2d(8, 8, 1, 1, 0, vs.pp("quant_conv"))?,
         })
     }
 
