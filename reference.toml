@@ -1,0 +1,6 @@
+repository = "https://github.com/Zhouqm-Git/osor"
+revision = "d5b68e822996d61aae6ba612e5e9b5a14f576879"
+pipeline = "osor-sdxlinpainting-phase2"
+reference_script = "osor-sdxlinpainting/scripts/inference_enhance.py"
+reference_config = "osor-sdxlinpainting/configs/phase2.yaml"
+paper = "https://arxiv.org/abs/2606.28094"
