@@ -12,6 +12,9 @@ default = []
 metal = ["dep:candle-metal-kernels", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["dep:candle-kernels", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 wgpu = ["dep:burn", "dep:pollster"]
+# macOS only: route Candle CPU matrix products through Apple Accelerate.
+# Changes CPU accumulation order; requalify stage tolerances before relying on it.
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 
 [dependencies]
 candle-core = { version = "=0.9.1", default-features = false }
@@ -50,5 +53,14 @@ opt-level = 1
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
+# Dependency debug assertions and overflow checks made Candle CPU inference
+# about 7x slower than release on the 80x96 qualification input.
 opt-level = 2
 debug = false
+debug-assertions = false
+overflow-checks = false
+
+# Timing and memory measurements use this profile, never the dev profile.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

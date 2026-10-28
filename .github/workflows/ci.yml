@@ -43,11 +43,47 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: mozilla-actions/sccache-action@v0.0.11
-      - name: Check Metal feature (build only)
+      - name: Check Metal and Accelerate features (build only)
         env:
           OSOR_SCRATCH_ROOT: ${{ runner.temp }}/osor-rs
         shell: bash
-        run: ./scripts/cargo.sh check --locked --all-targets --features metal
+        run: |
+          ./scripts/cargo.sh check --locked --all-targets --features metal
+          ./scripts/cargo.sh check --locked --all-targets --features accelerate
+
+  cuda-build:
+    # Compile-only: candle-kernels needs nvcc, not a GPU. This is source
+    # evidence, not CUDA device qualification.
+    name: CUDA feature compile (Linux container)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    env:
+      CUDA_COMPUTE_CAP: "80"
+    steps:
+      - name: Install build prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential pkg-config
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Check CUDA feature (build only)
+        env:
+          OSOR_SCRATCH_ROOT: ${{ runner.temp }}/osor-rs
+        shell: bash
+        run: ./scripts/cargo.sh check --locked --all-targets --features cuda
+
+  supply-chain:
+    # Enforces deny.toml: allowed code licenses, crates.io-only sources,
+    # banned libtorch/Python/model-download crates and triaged advisories.
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   wgpu:
     name: WGPU source checks (${{ matrix.os }})

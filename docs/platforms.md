@@ -3,6 +3,10 @@
 CPU is the default build on macOS, Linux, and Windows. Rust 1.95.0 is pinned in
 `rust-toolchain.toml`. CI is configured to run formatting, strict Clippy on all targets, all
 ordinary targets (including compiling the example), and doctests on each host.
+CI also compiles the Metal and Accelerate features on macOS, compiles the CUDA
+feature in an NVIDIA CUDA development container without a GPU, and runs
+`cargo deny check` against `deny.toml` (allowed code licenses, crates.io-only
+sources, banned libtorch/Python/model-download crates, and triaged advisories).
 CI downloads Rust dependencies but no model weights. A successful CI run is
 source/build and test evidence for that runner; it is not evidence of real-model
 numerical parity, GPU inference, performance, or acceptance on a user's machine.
@@ -51,7 +55,31 @@ See [the reference contract](reference-contract.md) for the numerical recipe
 and [artifact documentation](artifacts.md) for local bundle preparation and
 provenance. No model is fetched implicitly.
 
+## Build profiles
+
+Use the `profiling` profile (release optimizations with line tables) for any
+latency or memory measurement:
+
+```sh
+./scripts/cargo.sh run --locked --profile profiling --bin osor-profile -- \
+  /path/to/bundle /path/to/input.safetensors cpu 3
+```
+
+The dev profile keeps the crate at `opt-level = 1` for fast rebuilds and builds
+dependencies at `opt-level = 2` without debug assertions or overflow checks.
+Before that change, dependency debug assertions made Candle CPU inference about
+seven times slower than release on the 80×96 qualification input.
+
 ## Optional accelerators
+
+The `accelerate` feature (macOS only) routes Candle CPU matrix products through
+Apple Accelerate. It changes CPU accumulation order, so its acceptance is
+recorded separately in the [qualification record](qualification.md).
+
+```sh
+./scripts/cargo.sh check --locked --all-targets --features accelerate
+```
+
 
 On macOS with the Apple development tools installed, this checks that the Metal
 feature compiles; CI also performs this check on a macOS runner:

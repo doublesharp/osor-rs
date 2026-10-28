@@ -1,0 +1,59 @@
+# Supply-chain policy. Run with `cargo deny check` (CI runs it on every push).
+
+[graph]
+# Check every optional backend, not only the default CPU build.
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[licenses]
+# Code licenses only; model weight licenses are tracked separately in bundle
+# manifests and docs/artifacts.md.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    # File-level copyleft, used unmodified by the optional WGPU stack
+    # (buildid, colored).
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# AGENTS.md: no Python sidecar, libtorch runtime or implicit model download.
+deny = [
+    { name = "torch-sys", reason = "no libtorch runtime" },
+    { name = "tch", reason = "no libtorch runtime" },
+    { name = "pyo3", reason = "no Python sidecar or embedding" },
+    { name = "pyo3-ffi", reason = "no Python sidecar or embedding" },
+    { name = "hf-hub", reason = "no implicit model download" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# Each ignore names why the affected code is unreachable from this crate.
+ignore = [
+    # zip 1.3.1 is pinned by candle-core 0.9.1 (`zip = "^1.1.1"`) for .npz and
+    # PyTorch zip readers. These advisories concern `ZipArchive::extract`;
+    # Candle never calls it, and osor-rs never opens npz or pickle archives.
+    # Remove when Candle is upgraded to a release using a patched zip.
+    { id = "RUSTSEC-2025-0168", reason = "zip extract path; not called by Candle or osor-rs" },
+    { id = "RUSTSEC-2026-0367", reason = "zip extract path; not called by Candle or osor-rs" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract path; not called by Candle or osor-rs" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract path; not called by Candle or osor-rs" },
+    # paste is an unmaintained proc-macro used at build time by the optional
+    # Burn stack; no runtime code and no safe upgrade exists.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro in optional Burn stack" },
+]
