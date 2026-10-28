@@ -74,12 +74,13 @@ impl Im2Col {
     }
 }
 
-impl CustomOp1 for Im2Col {
-    fn name(&self) -> &'static str {
-        "osor-im2col"
-    }
-
-    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+impl Im2Col {
+    fn cpu_fwd_with_spawn_check(
+        &self,
+        storage: &CpuStorage,
+        layout: &Layout,
+        check_spawn: impl Fn() -> std::io::Result<()>,
+    ) -> Result<(CpuStorage, Shape)> {
         let (batch, channels, height, width) = layout.shape().dims4()?;
         if !layout.is_contiguous() {
             candle_core::bail!("im2col input must be contiguous")
@@ -100,22 +101,43 @@ impl CustomOp1 for Im2Col {
             .unwrap_or(1)
             .clamp(1, 16);
         let rows_per_thread = (batch * rows).div_ceil(threads).max(1);
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> Result<()> {
             for (chunk_index, chunk) in columns.chunks_mut(rows_per_thread * pixels).enumerate() {
-                scope.spawn(move || {
-                    for (offset, row) in chunk.chunks_mut(pixels).enumerate() {
-                        self.fill_row(
-                            source,
-                            (channels, height, width),
-                            rows,
-                            chunk_index * rows_per_thread + offset,
-                            row,
-                        );
-                    }
-                });
+                // The check lets the regression inject the same failure that
+                // fallible OS thread creation returns, without exhausting the host.
+                check_spawn()
+                    .and_then(|()| {
+                        std::thread::Builder::new().spawn_scoped(scope, move || {
+                            for (offset, row) in chunk.chunks_mut(pixels).enumerate() {
+                                self.fill_row(
+                                    source,
+                                    (channels, height, width),
+                                    rows,
+                                    chunk_index * rows_per_thread + offset,
+                                    row,
+                                );
+                            }
+                        })
+                    })
+                    .map_err(|error| {
+                        candle_core::Error::Msg(format!(
+                            "unable to create convolution worker; reduce concurrent inference jobs or raise the OS thread limit: {error}"
+                        ))
+                    })?;
             }
-        });
+            Ok(())
+        })?;
         Ok((CpuStorage::F32(columns), Shape::from((batch, rows, pixels))))
+    }
+}
+
+impl CustomOp1 for Im2Col {
+    fn name(&self) -> &'static str {
+        "osor-im2col"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        self.cpu_fwd_with_spawn_check(storage, layout, || Ok(()))
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -340,6 +362,32 @@ pub(super) fn conv2d(
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn thread_creation_failure_returns_an_actionable_error() -> Result<()> {
+        let op = Im2Col {
+            kernel: 1,
+            stride: 1,
+            padding: 0,
+            out_width: 4,
+            row_start: 0,
+            rows: 4,
+        };
+        let storage = CpuStorage::F32(vec![1.; 2 * 3 * 4 * 4]);
+        let layout = Layout::contiguous((2, 3, 4, 4));
+        let result = op.cpu_fwd_with_spawn_check(&storage, &layout, || {
+            Err(std::io::Error::other("injected thread limit"))
+        });
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(message.contains("convolution worker"), "{message}");
+                assert!(message.contains("injected thread limit"), "{message}");
+            }
+            Ok(_) => candle_core::bail!("thread creation failure must return an error"),
+        }
+        Ok(())
+    }
 
     fn max_difference(a: &Tensor, b: &Tensor) -> Result<f32> {
         (a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()

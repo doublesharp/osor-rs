@@ -2,7 +2,52 @@
 
 The Rust port still trails upstream PyTorch on Apple GPUs. These are engineering measurements on a shared Apple M2 Max with 96 GiB memory, not release benchmarks or a general comparison of programming languages.
 
-## Current measurements: Candle 0.11
+## Unreleased follow-up: 2026-10-28
+
+Metal F32 VAE normalization now uses bounded, anchored two-pass reductions
+with affine application in a custom kernel. Bias addition and nearest
+upsampling also use custom kernels. SiLU stays separate: the fused candidate
+failed the frozen small-case comparison and was rejected. CPU F32 UNet
+convolutions now use channel-major columns throughout the residual and
+sampling blocks; other device and dtype paths retain Candle.
+
+The final combined Metal profiling binary measured the same 640×384 photo,
+bundle, and explicit noise as v0.2.0. Loading took 8.115 s; the first inference
+took 1.493 s; three warm runs took 1.494, 1.537 and 1.679 s (mean **1.570 s**).
+Direct `/usr/bin/time -l` measured **10.596 GiB peak process footprint** over
+loading, retained inferences and the final synchronized stage profile. The
+earlier worker measured 1.429 s warm. These shared-host observations do not
+establish a latency distribution, a memory ceiling, or an isolated before/after
+benchmark. The two original frozen cases pass all 18 stages on the combined
+CPU, Metal and WGPU build; see [qualification](qualification.md).
+
+In a separate small-case CPU comparison with two warm samples, portable CPU
+measured 1.265 s before the UNet change and 1.002 s after it; Accelerate
+measured 0.672 s. The photo's worst decoded-image error did not improve
+(0.000121355 versus 0.000121266); no broader accuracy improvement is claimed.
+`RAYON_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` were four; column filling can
+still use up to 16 scoped workers. These are separate shared-host runs, not a
+four-thread CPU ceiling or a general recommendation to enable Accelerate.
+
+Current-source WGPU operator timing isolates the next bottleneck:
+
+| Shape | Group norm | SiLU | 3×3 convolution | 2× upsampling |
+|---|---:|---:|---:|---:|
+| 128×384×640 | 4.84 ms | 5.72 ms | 270.43 ms | 1.04 ms |
+| 256×192×320 | 2.64 ms | 2.96 ms | 289.05 ms | 0.66 ms |
+| 512×96×160 | 1.50 ms | 1.33 ms | 296.33 ms | 0.45 ms |
+
+Each value averages three synchronized warm dispatches on fixed synthetic
+F32 tensors, excluding the first dispatch, readback and model loading. These
+measurements identify convolution as the priority; they are not model latency
+or evidence for a replacement algorithm. No production WGPU algorithm was
+changed. The opt-in benchmark is
+`wgpu::model::operator_tests::gpu_vae_operator_timings`.
+
+Raw records remain under `/Volumes/Scratch/osor-rs/reports/codex-integration-20261028`
+and `/Volumes/Scratch/osor-rs/reports/codex-finish-20261028`.
+
+## v0.2.0 measurements: Candle 0.11
 
 Measured with `--profile profiling` on Candle 0.11.0, Burn 0.22.1 and the column-convolution VAE path. Same inputs, bundle and captured noise as the earlier sections; F32, batch one, two warm runs after one first run; loading excluded from inference times. The host was shared (load average about 15).
 

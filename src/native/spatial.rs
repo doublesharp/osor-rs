@@ -223,13 +223,79 @@ mod tests {
             && (a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()? == 0.0)
     }
 
+    // F64 projections, scores, softmax and output projection from the defining
+    // attention equations. No fixed-prompt cache or forced F32 intermediates.
+    fn reference_attention_f64(
+        weights: &HashMap<String, Tensor>,
+        prefix: &str,
+        input: &Tensor,
+        context: &Tensor,
+        heads: usize,
+    ) -> Result<Tensor> {
+        let project = |name: &str, xs: &Tensor| -> Result<Tensor> {
+            let (batch, tokens, width) = xs.dims3()?;
+            let key = format!("{prefix}.{name}");
+            let weight = weights.get(&format!("{key}.weight")).ok_or_else(|| {
+                candle_core::Error::Msg(format!("missing reference weight {key}"))
+            })?;
+            let output = xs
+                .to_dtype(DType::F64)?
+                .contiguous()?
+                .reshape((batch * tokens, width))?
+                .matmul(&weight.to_dtype(DType::F64)?.t()?)?;
+            let output = match weights.get(&format!("{key}.bias")) {
+                Some(bias) => output.broadcast_add(&bias.to_dtype(DType::F64)?)?,
+                None => output,
+            };
+            output.reshape((batch, tokens, ()))
+        };
+        let query = split_heads(&project("to_q", input)?, heads)?;
+        let key = split_heads(&project("to_k", context)?, heads)?;
+        let value = split_heads(&project("to_v", context)?, heads)?;
+        let scale = 1.0 / (query.dim(2)? as f64).sqrt();
+        let scores = (query.matmul(&key.t()?)? * scale)?;
+        let output = merge_heads(&nn::ops::softmax_last_dim(&scores)?.matmul(&value)?, heads)?;
+        project("to_out.0", &output)
+    }
+
     #[test]
-    fn cached_and_self_attention_match_candle_exactly() -> Result<()> {
+    fn cached_and_self_attention_match_candle_and_f64() -> Result<()> {
         let device = &Device::Cpu;
-        let variables = nn::VarMap::new();
-        let vs = VarBuilder::from_varmap(&variables, DType::F32, device);
         let (channels, heads, width) = (16, 4, 12);
-        let context = Tensor::randn(0f32, 1f32, (1, 5, width), device)?;
+        // Dyadic inputs and projection weights are exactly representable,
+        // making the cache equivalence check independent of BLAS tiling.
+        let values = |count: usize, salt: usize| {
+            (0..count)
+                .map(|i| (((i * 7 + salt) % 11) as f32 - 5.) / 16.)
+                .collect::<Vec<_>>()
+        };
+        let mut weights = HashMap::new();
+        for (prefix, context_width) in [("cross", width), ("self", channels)] {
+            for (index, (name, input_width)) in [
+                ("to_q", channels),
+                ("to_k", context_width),
+                ("to_v", context_width),
+                ("to_out.0", channels),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                weights.insert(
+                    format!("{prefix}.{name}.weight"),
+                    Tensor::from_vec(
+                        values(channels * input_width, index),
+                        (channels, input_width),
+                        device,
+                    )?,
+                );
+            }
+            weights.insert(
+                format!("{prefix}.to_out.0.bias"),
+                Tensor::from_vec(values(channels, 3), channels, device)?,
+            );
+        }
+        let vs = VarBuilder::from_tensors(weights.clone(), DType::F32, device);
+        let context = Tensor::from_vec(values(5 * width, 5), (1, 5, width), device)?;
         let candle_cross = CrossAttention::new(
             vs.pp("cross"),
             channels,
@@ -251,16 +317,34 @@ mod tests {
         let cross = FixedCrossAttention::new(vs.pp("cross"), channels, heads, &context)?;
         let self_attention = SelfAttention::new(vs.pp("self"), channels, heads)?;
         for batch in [1, 2] {
-            let xs = Tensor::randn(0f32, 1f32, (batch, 7, channels), device)?;
+            let xs = Tensor::from_vec(
+                values(batch * 7 * channels, 2),
+                (batch, 7, channels),
+                device,
+            )?;
             let batch_context = context.repeat((batch, 1, 1))?;
-            assert!(identical(
-                &cross.forward(&xs)?,
-                &candle_cross.forward(&xs, Some(&batch_context))?
-            )?);
-            assert!(identical(
-                &self_attention.forward(&xs)?,
-                &candle_self.forward(&xs, None)?
-            )?);
+            let cached = cross.forward(&xs)?;
+            let direct_cross = candle_cross.forward(&xs, Some(&batch_context))?;
+            let own_self = self_attention.forward(&xs)?;
+            let direct_self = candle_self.forward(&xs, None)?;
+            assert!(identical(&cached, &direct_cross)?);
+            assert!(identical(&own_self, &direct_self)?);
+            let reference_cross =
+                reference_attention_f64(&weights, "cross", &xs, &batch_context, heads)?;
+            let reference_self = reference_attention_f64(&weights, "self", &xs, &xs, heads)?;
+            for (actual, reference) in [
+                (&cached, &reference_cross),
+                (&direct_cross, &reference_cross),
+                (&own_self, &reference_self),
+                (&direct_self, &reference_self),
+            ] {
+                let error = (actual.to_dtype(DType::F64)? - reference)?
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_scalar::<f64>()?;
+                assert!(error <= 1e-5, "batch {batch} F64 attention error {error}");
+            }
         }
         Ok(())
     }

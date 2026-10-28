@@ -7,6 +7,10 @@ use super::Architecture;
 use super::conv::{BandedConv2d, conv2d};
 use crate::{Result, pipeline::Checkpoint};
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "metal_ops.rs"]
+pub(super) mod metal_ops;
+
 const GROUPS: usize = 32;
 const EPS: f64 = 1e-6;
 const REDUCTION_CHUNK: usize = 256;
@@ -47,10 +51,8 @@ impl StableGroupNorm {
             channels,
         })
     }
-}
 
-impl Module for StableGroupNorm {
-    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn forward_reference(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         let (batch, channels, height, width) = input.dims4()?;
         if channels != self.channels || batch == 0 || height == 0 || width == 0 {
             candle_core::bail!("invalid VAE group normalization input shape")
@@ -76,6 +78,29 @@ impl Module for StableGroupNorm {
             .reshape((batch, channels, height, width))?
             .broadcast_mul(&self.weight.reshape((1, channels, 1, 1))?)?
             .broadcast_add(&self.bias.reshape((1, channels, 1, 1))?)
+    }
+
+    pub(super) fn forward_silu(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        nn::ops::silu(&self.forward(input)?)
+    }
+}
+
+impl Module for StableGroupNorm {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if input.device().is_metal()
+            && input.dtype() == DType::F32
+            && self.weight.dtype() == DType::F32
+            && self.bias.dtype() == DType::F32
+            && u32::try_from(input.elem_count()).is_ok()
+        {
+            let (batch, channels, height, width) = input.dims4()?;
+            if channels != self.channels || batch == 0 || height == 0 || width == 0 {
+                candle_core::bail!("invalid VAE group normalization input shape")
+            }
+            return metal_ops::group_norm(input, &self.weight, &self.bias);
+        }
+        self.forward_reference(input)
     }
 }
 
@@ -111,12 +136,8 @@ impl Resnet {
             Some(conv) => conv.forward(xs)?,
             None => xs.clone(),
         };
-        let hidden = self
-            .conv1
-            .forward(&nn::ops::silu(&self.norm1.forward(xs)?)?)?;
-        let hidden = self
-            .conv2
-            .forward(&nn::ops::silu(&self.norm2.forward(&hidden)?)?)?;
+        let hidden = self.conv1.forward(&self.norm1.forward_silu(xs)?)?;
+        let hidden = self.conv2.forward(&self.norm2.forward_silu(&hidden)?)?;
         shortcut + hidden
     }
 }
@@ -232,6 +253,22 @@ impl Attention {
 
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         let (batch, channels, height, width) = input.dims4()?;
+        if batch > 1 && input.device().is_metal() {
+            // Candle 0.11's batched Metal attention changes entries after
+            // the first even when normalization and projections agree.
+            // Keep each image on the qualified single-image device path.
+            if batch > crate::pipeline::MAX_BATCH {
+                candle_core::bail!("VAE attention batch exceeds the inference limit")
+            }
+            let mut entries = Vec::new();
+            entries.try_reserve_exact(batch).map_err(|error| {
+                candle_core::Error::Msg(format!("cannot allocate VAE attention batch: {error}"))
+            })?;
+            for entry in 0..batch {
+                entries.push(self.forward(&input.narrow(0, entry, 1)?)?);
+            }
+            return Tensor::cat(&entries, 0);
+        }
         let tokens = height
             .checked_mul(width)
             .ok_or_else(|| candle_core::Error::Msg("VAE attention shape overflows".into()))?;
@@ -240,6 +277,15 @@ impl Attention {
             .forward(input)?
             .reshape((batch, channels, tokens))?
             .transpose(1, 2)?;
+        // Candle 0.11's CPU linear path flattens batched inputs. A transposed
+        // [B, tokens, channels] view has a different stride between images;
+        // materialize it before projection so entries after the first use
+        // their own pixels. Other device and batch-one paths stay unchanged.
+        let xs = if batch > 1 && input.device().is_cpu() {
+            xs.contiguous()?
+        } else {
+            xs
+        };
         let query = self
             .query
             .forward(&xs)?
@@ -337,7 +383,7 @@ impl VaeEncoder {
         }
         checkpoint()?;
         xs = self.mid.forward(&xs, None)?;
-        xs = nn::ops::silu(&self.norm_out.forward(&xs)?)?;
+        xs = self.norm_out.forward_silu(&xs)?;
         Ok(self.quant_conv.forward(&self.conv_out.forward(&xs)?)?)
     }
 }
@@ -354,6 +400,325 @@ mod tests {
         weights.insert("weight".into(), Tensor::ones(32, DType::F32, device)?);
         weights.insert("bias".into(), Tensor::from_vec(vec![bias; 32], 32, device)?);
         StableGroupNorm::new(32, VarBuilder::from_tensors(weights, DType::F32, device))
+    }
+
+    #[test]
+    fn attention_preserves_distinct_batch_entries() -> candle_core::Result<()> {
+        check_attention_batch_entries(&Device::Cpu)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_attention_preserves_distinct_batch_entries() -> candle_core::Result<()> {
+        check_attention_batch_entries(&Device::new_metal(0)?)
+    }
+
+    fn check_attention_batch_entries(device: &Device) -> candle_core::Result<()> {
+        let values = |count: usize, multiplier: usize, modulus: usize, scale: f32| {
+            (0..count)
+                .map(|i| ((i * multiplier % modulus) as f32 - (modulus / 2) as f32) * scale)
+                .collect::<Vec<_>>()
+        };
+        let linear = |multiplier| -> candle_core::Result<nn::Linear> {
+            let weight = Tensor::from_vec(
+                values(32 * 32, multiplier, 103, 1.0 / 512.0),
+                (32, 32),
+                device,
+            )?;
+            let bias = Tensor::from_vec(values(32, multiplier, 31, 1.0 / 256.0), 32, device)?;
+            Ok(nn::Linear::new(weight, Some(bias)))
+        };
+        let attention = Attention {
+            norm: StableGroupNorm::new(
+                32,
+                VarBuilder::from_tensors(
+                    HashMap::from([
+                        ("weight".into(), Tensor::ones(32, DType::F32, device)?),
+                        (
+                            "bias".into(),
+                            Tensor::from_vec(vec![0.125f32; 32], 32, device)?,
+                        ),
+                    ]),
+                    DType::F32,
+                    device,
+                ),
+            )?,
+            query: linear(37)?,
+            key: linear(41)?,
+            value: linear(43)?,
+            output: linear(47)?,
+            channels: 32,
+        };
+        let max_error = |a: &Tensor, b: &Tensor| -> candle_core::Result<f64> {
+            (a.to_device(&Device::Cpu)?.to_dtype(DType::F64)?
+                - b.to_device(&Device::Cpu)?.to_dtype(DType::F64)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f64>()
+        };
+        for (batch, height, width) in [(2, 5, 7), (4, 11, 13)] {
+            let input = Tensor::from_vec(
+                values(batch * 32 * height * width, 53, 211, 1.0 / 64.0),
+                (batch, 32, height, width),
+                device,
+            )?;
+            let normalized = attention.norm.forward(&input)?;
+            let tokens = normalized
+                .reshape((batch, 32, height * width))?
+                .transpose(1, 2)?;
+            // Probe Candle's raw strided projection as a diagnostic; the
+            // behavioral assertion below exercises Attention::forward itself.
+            let strided_query = attention.query.forward(&tokens)?;
+            let batched_output = attention.forward(&input)?;
+            for entry in 0..batch {
+                let single = input.narrow(0, entry, 1)?.contiguous()?;
+                let single_normalized = attention.norm.forward(&single)?;
+                let single_tokens = single_normalized
+                    .reshape((1, 32, height * width))?
+                    .transpose(1, 2)?;
+                let single_query = attention.query.forward(&single_tokens)?;
+                let reference_query = single_tokens
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F64)?
+                    .contiguous()?
+                    .reshape((height * width, 32))?
+                    .matmul(
+                        &attention
+                            .query
+                            .weight()
+                            .to_device(&Device::Cpu)?
+                            .to_dtype(DType::F64)?
+                            .t()?,
+                    )?
+                    .broadcast_add(
+                        &attention
+                            .query
+                            .bias()
+                            .ok_or_else(|| candle_core::Error::Msg("missing query bias".into()))?
+                            .to_device(&Device::Cpu)?
+                            .to_dtype(DType::F64)?,
+                    )?
+                    .unsqueeze(0)?;
+                let norm_error = max_error(&normalized.narrow(0, entry, 1)?, &single_normalized)?;
+                let single_error = max_error(&single_query, &reference_query)?;
+                let strided_error =
+                    max_error(&strided_query.narrow(0, entry, 1)?, &reference_query)?;
+                eprintln!(
+                    "batch {batch} {height}x{width} entry {entry}: norm={norm_error}, single query vs f64={single_error}, raw strided query vs f64={strided_error}"
+                );
+                assert!(
+                    norm_error <= 2e-5,
+                    "batch normalization differs by {norm_error}"
+                );
+                assert!(
+                    single_error <= 3e-6,
+                    "single query F64 error {single_error}"
+                );
+                let output_error = max_error(
+                    &batched_output.narrow(0, entry, 1)?,
+                    &attention.forward(&single)?,
+                )?;
+                eprintln!(
+                    "batch {batch} entry {entry}: attention output difference={output_error}"
+                );
+                assert!(
+                    output_error <= 1e-5,
+                    "batch attention differs by {output_error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // Compute the reference on CPU in f64, independently of Candle's
+    // reductions. Transpose and narrow exercise noncontiguous and offset views.
+    fn check_normalization_reference(device: &Device) -> candle_core::Result<()> {
+        for (batch, channels, height, width, transposed, large_offset) in [
+            (1, 32, 1, 1, false, false),
+            (2, 64, 3, 7, true, false),
+            (2, 32, 1, 257, false, false),
+            (2, 32, 1, 4097, false, false),
+            (1, 32, 128, 256, false, true),
+        ] {
+            let elements = (batch + 1) * channels * height * width;
+            let values: Vec<f32> = (0..elements)
+                .map(|i| {
+                    if large_offset {
+                        if i % 2 == 0 { 9.99 } else { 10.01 }
+                    } else {
+                        ((i * 37 % 101) as f32 - 50.0) * 0.03125
+                    }
+                })
+                .collect();
+            let shape = if transposed {
+                (batch + 1, channels, width, height)
+            } else {
+                (batch + 1, channels, height, width)
+            };
+            let source = Tensor::from_vec(values, shape, device)?.narrow(0, 1, batch)?;
+            let input = if transposed {
+                source.transpose(2, 3)?
+            } else {
+                source
+            };
+            let scale: Vec<f32> = (0..channels)
+                .map(|channel| 0.5 + (channel % 5) as f32 * 0.125)
+                .collect();
+            let bias: Vec<f32> = (0..channels)
+                .map(|channel| (channel % 7) as f32 * 0.0625 - 0.125)
+                .collect();
+            let parameter = |values: &[f32]| -> candle_core::Result<Tensor> {
+                let strided: Vec<f32> = values.iter().flat_map(|&value| [0.0, value]).collect();
+                Tensor::from_vec(strided, (channels, 2), device)?
+                    .narrow(1, 1, 1)?
+                    .squeeze(1)
+            };
+            let weights = HashMap::from([
+                ("weight".into(), parameter(&scale)?),
+                ("bias".into(), parameter(&bias)?),
+            ]);
+            let norm = StableGroupNorm::new(
+                channels,
+                VarBuilder::from_tensors(weights, DType::F32, device),
+            )?;
+            let source = input
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = norm
+                .forward(&input)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let fused = norm
+                .forward_silu(&input)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let per_channel = height * width;
+            let per_group = channels / GROUPS * per_channel;
+            let mut max_error = 0.0_f64;
+            let mut max_silu_error = 0.0_f64;
+            for (group_index, ((group, output), fused_output)) in source
+                .chunks_exact(per_group)
+                .zip(actual.chunks_exact(per_group))
+                .zip(fused.chunks_exact(per_group))
+                .enumerate()
+            {
+                let mean = group.iter().map(|&x| f64::from(x)).sum::<f64>() / per_group as f64;
+                let variance = group
+                    .iter()
+                    .map(|&x| (f64::from(x) - mean).powi(2))
+                    .sum::<f64>()
+                    / per_group as f64;
+                let denominator = (variance + EPS).sqrt();
+                for (offset, ((&value, &actual), &fused_actual)) in
+                    group.iter().zip(output).zip(fused_output).enumerate()
+                {
+                    let channel =
+                        (group_index % GROUPS) * (channels / GROUPS) + offset / per_channel;
+                    let (&scale, &bias) =
+                        scale.get(channel).zip(bias.get(channel)).ok_or_else(|| {
+                            candle_core::Error::Msg("reference channel missing".into())
+                        })?;
+                    let expected = (f64::from(value) - mean) / denominator * f64::from(scale)
+                        + f64::from(bias);
+                    assert!(actual.is_finite(), "nonfinite group normalization output");
+                    assert!(fused_actual.is_finite(), "nonfinite norm and SiLU output");
+                    max_error = max_error.max((f64::from(actual) - expected).abs());
+                    let expected_silu = expected / (1.0 + (-expected).exp());
+                    max_silu_error =
+                        max_silu_error.max((f64::from(fused_actual) - expected_silu).abs());
+                }
+            }
+            assert!(
+                max_error <= 2e-5,
+                "shape {batch}x{channels}x{height}x{width}, transposed={transposed}, offset={large_offset}: max error {max_error}"
+            );
+            assert!(
+                max_silu_error <= 2e-5,
+                "norm and SiLU shape {batch}x{channels}x{height}x{width}, transposed={transposed}, offset={large_offset}: max error {max_silu_error}"
+            );
+        }
+        Ok(())
+    }
+
+    fn check_wide_magnitude_reference(device: &Device) -> candle_core::Result<()> {
+        let values: Vec<f32> = (0..2 * 32 * 4096)
+            .map(|i| match i % 4 {
+                0 => 1e10,
+                1 => -1e10,
+                2 => 1e-10,
+                _ => -1e-10,
+            })
+            .collect();
+        let input = Tensor::from_vec(values.clone(), (2, 32, 1, 4096), device)?;
+        let weights = HashMap::from([
+            ("weight".into(), Tensor::ones(32, DType::F32, device)?),
+            ("bias".into(), Tensor::zeros(32, DType::F32, device)?),
+        ]);
+        let norm = StableGroupNorm::new(32, VarBuilder::from_tensors(weights, DType::F32, device))?;
+        let actual = norm
+            .forward(&input)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let denominator = (0.5 * (1e10_f64.powi(2) + 1e-10_f64.powi(2)) + EPS).sqrt();
+        let mut max_error = 0.0_f64;
+        for (&actual, &input) in actual.iter().zip(&values) {
+            assert!(actual.is_finite(), "nonfinite wide-magnitude normalization");
+            max_error = max_error.max((f64::from(actual) - f64::from(input) / denominator).abs());
+        }
+        assert!(max_error <= 2e-5, "wide-magnitude max error {max_error}");
+        Ok(())
+    }
+
+    #[test]
+    fn group_normalization_matches_f64_reference_for_views_and_group_sizes()
+    -> candle_core::Result<()> {
+        check_normalization_reference(&Device::Cpu)?;
+        check_wide_magnitude_reference(&Device::Cpu)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_group_normalization_matches_f64_reference_for_views_and_group_sizes()
+    -> candle_core::Result<()> {
+        let device = &Device::new_metal(0)?;
+        check_normalization_reference(device)?;
+        check_wide_magnitude_reference(device)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_half_group_normalization_keeps_existing_dtype_path() -> candle_core::Result<()> {
+        let device = &Device::new_metal(0)?;
+        let dtype = DType::F16;
+        let input = Tensor::arange(0f32, 512f32, device)?
+            .reshape((1, 64, 2, 4))?
+            .to_dtype(dtype)?;
+        let weights = HashMap::from([
+            ("weight".into(), Tensor::ones(64, dtype, device)?),
+            ("bias".into(), Tensor::zeros(64, dtype, device)?),
+        ]);
+        let norm = StableGroupNorm::new(64, VarBuilder::from_tensors(weights, dtype, device))?;
+        let actual = norm
+            .forward(&input)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = norm
+            .forward_reference(&input)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(actual, expected);
+        assert_eq!(norm.forward(&input)?.dtype(), dtype);
+        Ok(())
     }
 
     #[test]

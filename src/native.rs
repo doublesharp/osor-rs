@@ -10,8 +10,11 @@ mod cross_blocks;
 mod metal_bench;
 #[cfg(test)]
 mod precision_tests;
+mod resnet;
 mod spatial;
 mod transformer;
+mod unet_blocks;
+mod unet_conv;
 mod vae_decoder;
 mod vae_encoder;
 
@@ -19,9 +22,11 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self as nn, Module, VarBuilder};
+#[cfg(test)]
+use candle_transformers::models::stable_diffusion::unet_2d_blocks::{DownBlock2D, UpBlock2D};
 use candle_transformers::models::stable_diffusion::{
     embeddings::{TimestepEmbedding, Timesteps},
-    unet_2d_blocks::{DownBlock2D, DownBlock2DConfig, UpBlock2D, UpBlock2DConfig},
+    unet_2d_blocks::{DownBlock2DConfig, UpBlock2DConfig},
 };
 
 use crate::{
@@ -29,6 +34,8 @@ use crate::{
     pipeline::{Checkpoint, IMAGE_AXIS_MULTIPLE, MAX_BATCH, MAX_IMAGE_AXIS, MIN_IMAGE_AXIS},
 };
 use cross_blocks::{CrossConfig, CrossDown, CrossMid, CrossUp};
+use unet_blocks::{PlainDown, PlainUp};
+use unet_conv::UnetConv2d;
 use vae_decoder::VaeDecoder;
 use vae_encoder::VaeEncoder;
 
@@ -85,18 +92,18 @@ impl Architecture {
 
 #[derive(Debug)]
 enum Down {
-    Plain(DownBlock2D),
+    Plain(PlainDown),
     Cross(CrossDown),
 }
 
 #[derive(Debug)]
 enum Up {
-    Plain(UpBlock2D),
+    Plain(PlainUp),
     Cross(CrossUp),
 }
 
 struct Unet {
-    conv_in: nn::Conv2d,
+    conv_in: UnetConv2d,
     time_proj: Timesteps,
     time_embedding: TimestepEmbedding,
     add_time_proj: Timesteps,
@@ -105,7 +112,7 @@ struct Unet {
     mid: CrossMid,
     up: Vec<Up>,
     norm_out: nn::GroupNorm,
-    conv_out: nn::Conv2d,
+    conv_out: UnetConv2d,
     pooled: Tensor,
     arch: Architecture,
 }
@@ -135,11 +142,7 @@ impl Unet {
         let blocks = arch.blocks;
         let base = blocks[0].channels;
         let time_dim = base * 4;
-        let conv_cfg = nn::Conv2dConfig {
-            padding: 1,
-            ..Default::default()
-        };
-        let conv_in = nn::conv2d(9, base, 3, conv_cfg, vs.pp("conv_in"))?;
+        let conv_in = UnetConv2d::new(9, base, 3, 1, 1, vs.pp("conv_in"))?;
         let time_proj = Timesteps::new(base, true, 0.);
         let time_embedding = TimestepEmbedding::new(vs.pp("time_embedding"), base, time_dim)?;
         let add_time_proj = Timesteps::new(arch.time_projection, true, 0.);
@@ -174,7 +177,7 @@ impl Unet {
                     i + 1 < blocks.len(),
                     context,
                 )?),
-                None => Down::Plain(DownBlock2D::new(
+                None => Down::Plain(PlainDown::new(
                     path,
                     in_channels,
                     spec.channels,
@@ -234,7 +237,7 @@ impl Unet {
                     i + 1 < blocks.len(),
                     context,
                 )?),
-                None => Up::Plain(UpBlock2D::new(
+                None => Up::Plain(PlainUp::new(
                     path,
                     in_channels,
                     prev,
@@ -246,7 +249,7 @@ impl Unet {
             up.push(block);
         }
         let norm_out = nn::group_norm(32, base, 1e-5, vs.pp("conv_norm_out"))?;
-        let conv_out = nn::conv2d(base, 5, 3, conv_cfg, vs.pp("conv_out"))?;
+        let conv_out = UnetConv2d::new(base, 5, 3, 1, 1, vs.pp("conv_out"))?;
         Ok(Self {
             conv_in,
             time_proj,
@@ -333,7 +336,7 @@ impl Unet {
         for (index, block) in self.up.iter().enumerate() {
             checkpoint()?;
             let count = match block {
-                Up::Plain(b) => b.resnets.len(),
+                Up::Plain(b) => b.residual_count(),
                 Up::Cross(b) => b.residual_count(),
             };
             let start = residuals.len().checked_sub(count).ok_or_else(|| {
@@ -591,6 +594,110 @@ mod tests {
 
     fn differs(a: &Tensor, b: &Tensor) -> Result<bool> {
         Ok((a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()? > 1e-7)
+    }
+
+    #[test]
+    fn unet_input_convolution_tracks_f64_reference() -> Result<()> {
+        let mut tiny = Tiny::new();
+        let (sequence, pooled) = conditioning()?;
+        let model = tiny.model(&sequence, &pooled)?;
+        let device = &Device::Cpu;
+        let values = |count: usize, multiplier: usize, modulus: usize| {
+            (0..count)
+                .map(|i| ((i * multiplier % modulus) as f32 - (modulus / 2) as f32) / 37.)
+                .collect::<Vec<_>>()
+        };
+        let weight = Tensor::from_vec(values(64 * 9 * 9, 61, 101), (64, 9, 3, 3), device)?;
+        let bias = Tensor::zeros(64, DType::F32, device)?;
+        tiny.unet.set_one("conv_in.weight", &weight)?;
+        tiny.unet.set_one("conv_in.bias", &bias)?;
+        let mut failures = Vec::new();
+        for batch in [1, 2] {
+            let input =
+                Tensor::from_vec(values(batch * 9 * 5 * 7, 43, 103), (batch, 9, 5, 7), device)?;
+            let reference = nn::Conv2d::new(
+                weight.to_dtype(DType::F64)?,
+                Some(bias.to_dtype(DType::F64)?),
+                nn::Conv2dConfig {
+                    padding: 1,
+                    ..Default::default()
+                },
+            )
+            .forward(&input.to_dtype(DType::F64)?)?;
+            let actual = model.unet.conv_in.forward(&input)?.to_dtype(DType::F64)?;
+            let max_error = (&actual - &reference)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_scalar::<f64>()?;
+            eprintln!("batch {batch} maximum F64 error: {max_error}");
+            if max_error > 6.2e-6 {
+                failures.push((batch, max_error));
+            }
+        }
+        assert!(failures.is_empty(), "F64 convolution errors: {failures:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn plain_unet_blocks_match_candle_for_one_and_two_images() -> Result<()> {
+        let tiny = Tiny::new();
+        let (sequence, pooled) = conditioning()?;
+        let model = tiny.model(&sequence, &pooled)?;
+        let device = &Device::Cpu;
+        let vs = VarBuilder::from_varmap(&tiny.unet, DType::F32, device);
+        let down_reference = DownBlock2D::new(
+            vs.pp("down_blocks.0"),
+            64,
+            64,
+            Some(256),
+            DownBlock2DConfig {
+                num_layers: 1,
+                resnet_eps: 1e-5,
+                ..Default::default()
+            },
+        )?;
+        let up_reference = UpBlock2D::new(
+            vs.pp("up_blocks.2"),
+            64,
+            64,
+            64,
+            Some(256),
+            UpBlock2DConfig {
+                num_layers: 2,
+                resnet_eps: 1e-5,
+                add_upsample: false,
+                ..Default::default()
+            },
+        )?;
+        let Some(Down::Plain(down)) = model.unet.down.first() else {
+            return Err(Error::InvalidArtifact("missing plain down block".into()));
+        };
+        let Some(Up::Plain(up)) = model.unet.up.last() else {
+            return Err(Error::InvalidArtifact("missing plain up block".into()));
+        };
+        let max_error = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            Ok((a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?)
+        };
+        for batch in [1, 2] {
+            let input = Tensor::randn(0f32, 1f32, (batch, 64, 5, 7), device)?;
+            let temb = Tensor::randn(0f32, 1f32, (batch, 256), device)?;
+            let (actual, saved) = down.forward(&input, Some(&temb))?;
+            let (expected, reference_saved) = down_reference.forward(&input, Some(&temb))?;
+            assert_eq!(actual.dims(), &[batch, 64, 3, 4]);
+            assert_eq!(saved.len(), 2);
+            assert_eq!(saved.len(), reference_saved.len());
+            assert!(max_error(&actual, &expected)? <= 3e-5);
+            for (actual, expected) in saved.iter().zip(&reference_saved) {
+                assert!(max_error(actual, expected)? <= 3e-5);
+            }
+            let skips = vec![input.clone(), input.clone()];
+            let actual = up.forward(&input, &skips, Some(&temb), None)?;
+            let expected = up_reference.forward(&input, &skips, Some(&temb), None)?;
+            assert_eq!(actual.dims(), &[batch, 64, 5, 7]);
+            assert!(max_error(&actual, &expected)? <= 3e-5);
+        }
+        Ok(())
     }
 
     #[test]

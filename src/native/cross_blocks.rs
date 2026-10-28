@@ -1,9 +1,9 @@
-//! SDXL cross-attention block orchestration, using Candle's public ResNet layers.
+//! SDXL cross-attention block orchestration.
 use candle_core::{Result, Tensor};
-use candle_nn::{self as nn, Module, VarBuilder};
-use candle_transformers::models::stable_diffusion::resnet::{ResnetBlock2D, ResnetBlock2DConfig};
+use candle_nn::{Module, VarBuilder};
+use candle_transformers::models::stable_diffusion::resnet::ResnetBlock2DConfig;
 
-use super::spatial::SpatialTransformer;
+use super::{resnet::Resnet, spatial::SpatialTransformer, unet_conv::UnetConv2d};
 
 #[derive(Clone, Copy)]
 pub(super) struct CrossConfig {
@@ -14,13 +14,8 @@ pub(super) struct CrossConfig {
     pub depth: usize,
 }
 
-fn resnet(
-    vs: VarBuilder<'_>,
-    input: usize,
-    output: usize,
-    time_dim: usize,
-) -> Result<ResnetBlock2D> {
-    ResnetBlock2D::new(
+fn resnet(vs: VarBuilder<'_>, input: usize, output: usize, time_dim: usize) -> Result<Resnet> {
+    Resnet::new(
         vs,
         input,
         ResnetBlock2DConfig {
@@ -39,8 +34,8 @@ fn attention(vs: VarBuilder<'_>, cfg: CrossConfig, context: &Tensor) -> Result<S
 
 #[derive(Debug)]
 pub(super) struct CrossDown {
-    layers: Vec<(ResnetBlock2D, SpatialTransformer)>,
-    downsample: Option<nn::Conv2d>,
+    layers: Vec<(Resnet, SpatialTransformer)>,
+    downsample: Option<UnetConv2d>,
 }
 
 impl CrossDown {
@@ -60,15 +55,12 @@ impl CrossDown {
             ));
         }
         let downsample = if downsample {
-            Some(nn::conv2d(
+            Some(UnetConv2d::new(
                 cfg.channels,
                 cfg.channels,
                 3,
-                nn::Conv2dConfig {
-                    stride: 2,
-                    padding: 1,
-                    ..Default::default()
-                },
+                2,
+                1,
                 vs.pp("downsamplers.0.conv"),
             )?)
         } else {
@@ -95,8 +87,8 @@ impl CrossDown {
 
 #[derive(Debug)]
 pub(super) struct CrossUp {
-    layers: Vec<(ResnetBlock2D, SpatialTransformer)>,
-    upsample: Option<nn::Conv2d>,
+    layers: Vec<(Resnet, SpatialTransformer)>,
+    upsample: Option<UnetConv2d>,
 }
 
 impl CrossUp {
@@ -127,14 +119,12 @@ impl CrossUp {
             ));
         }
         let upsample = if upsample {
-            Some(nn::conv2d(
+            Some(UnetConv2d::new(
                 cfg.channels,
                 cfg.channels,
                 3,
-                nn::Conv2dConfig {
-                    padding: 1,
-                    ..Default::default()
-                },
+                1,
+                1,
                 vs.pp("upsamplers.0.conv"),
             )?)
         } else {
@@ -183,9 +173,9 @@ impl CrossUp {
 }
 
 struct MidLayers {
-    initial: ResnetBlock2D,
+    initial: Resnet,
     attention: SpatialTransformer,
-    final_resnet: ResnetBlock2D,
+    final_resnet: Resnet,
 }
 
 pub(super) struct CrossMid(MidLayers);
@@ -208,6 +198,7 @@ impl CrossMid {
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
+    use candle_nn as nn;
     use candle_transformers::models::stable_diffusion::unet_2d_blocks::{
         CrossAttnDownBlock2D, CrossAttnDownBlock2DConfig, CrossAttnUpBlock2D,
         CrossAttnUpBlock2DConfig, DownBlock2DConfig, UNetMidBlock2DCrossAttn,
@@ -303,6 +294,131 @@ mod tests {
                 shapes(&ours)?,
                 shapes(&candle)?,
                 "parameter mismatch at depth {depth}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cross_up_matches_candle_for_batched_and_odd_upsamples() -> Result<()> {
+        let device = &Device::Cpu;
+        let mut variables = nn::VarMap::new();
+        let vs = VarBuilder::from_varmap(&variables, DType::F32, device);
+        let values = |count: usize, seed: usize| {
+            (0..count)
+                .map(|i| (((i * 43 + seed) % 103) as f32 - 51.) / 37.)
+                .collect::<Vec<_>>()
+        };
+        let context = Tensor::from_vec(values(24, 3), (1, 3, 8), device)?;
+        let cfg = CrossConfig {
+            layers: 2,
+            channels: 64,
+            time_dim: 128,
+            heads: 2,
+            depth: 1,
+        };
+        // Populate the shared variable map before assigning deterministic weights.
+        let _ = CrossUp::new(vs.clone(), 64, 64, cfg, true, &context)?;
+        let candle = CrossAttnUpBlock2D::new(
+            vs,
+            64,
+            64,
+            64,
+            Some(128),
+            false,
+            CrossAttnUpBlock2DConfig {
+                upblock: UpBlock2DConfig {
+                    num_layers: 2,
+                    resnet_eps: 1e-5,
+                    ..Default::default()
+                },
+                attn_num_head_channels: 2,
+                cross_attention_dim: 8,
+                use_linear_projection: true,
+                transformer_layers_per_block: 1,
+                ..Default::default()
+            },
+        )?;
+        {
+            let tensors = variables
+                .data()
+                .lock()
+                .map_err(|_| candle_core::Error::Msg("variable lock poisoned".into()))?;
+            for (name, variable) in tensors.iter() {
+                if name.ends_with(".weight") && variable.dims().len() > 1 {
+                    let fan_in = variable.dims().iter().skip(1).product::<usize>();
+                    let scale = 1. / (fan_in as f32).sqrt();
+                    let mut state = name
+                        .bytes()
+                        .fold(17u32, |s, b| s.wrapping_mul(31).wrapping_add(u32::from(b)));
+                    let weights = (0..variable.elem_count())
+                        .map(|_| {
+                            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            (((state >> 16) as f32 / 32_768.) - 1.) * scale
+                        })
+                        .collect::<Vec<_>>();
+                    variable.set(&Tensor::from_vec(
+                        weights,
+                        variable.shape().clone(),
+                        device,
+                    )?)?;
+                } else if name.ends_with(".bias") {
+                    variable.set(&Tensor::zeros(
+                        variable.shape().clone(),
+                        DType::F32,
+                        device,
+                    )?)?;
+                }
+            }
+        }
+        // Candle 0.11 uses approximate GELU; OSOR's transformer deliberately
+        // uses the reference's exact GELU. Suppress only that feed-forward
+        // output so this comparison isolates the surrounding block behavior.
+        for layer in 0..2 {
+            let prefix = format!("attentions.{layer}.transformer_blocks.0.ff.net.2");
+            variables.set_one(
+                format!("{prefix}.weight"),
+                Tensor::zeros((64, 256), DType::F32, device)?,
+            )?;
+            variables.set_one(
+                format!("{prefix}.bias"),
+                Tensor::zeros(64, DType::F32, device)?,
+            )?;
+        }
+        // The fixed attention keys and values must use the deterministic weights.
+        let ours = CrossUp::new(
+            VarBuilder::from_varmap(&variables, DType::F32, device),
+            64,
+            64,
+            cfg,
+            true,
+            &context,
+        )?;
+        for batch in [1, 2] {
+            let input =
+                Tensor::from_vec(values(batch * 64 * 3 * 5, 11), (batch, 64, 3, 5), device)?;
+            let skips = vec![
+                Tensor::from_vec(values(batch * 64 * 3 * 5, 17), (batch, 64, 3, 5), device)?,
+                Tensor::from_vec(values(batch * 64 * 3 * 5, 29), (batch, 64, 3, 5), device)?,
+            ];
+            let temb = Tensor::from_vec(values(batch * 128, 23), (batch, 128), device)?;
+            let full_context = context.repeat((batch, 1, 1))?;
+            for size in [None, Some((5, 9))] {
+                let actual = ours.forward(&input, &skips, Some(&temb), size)?;
+                let expected =
+                    candle.forward(&input, &skips, Some(&temb), size, Some(&full_context))?;
+                let (height, width) = size.unwrap_or((6, 10));
+                assert_eq!(actual.dims(), &[batch, 64, height, width]);
+                let error = (actual - expected)?
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_scalar::<f32>()?;
+                assert!(error <= 3e-5, "batch {batch}, size {size:?}: error {error}");
+            }
+            assert!(
+                ours.forward(&input, std::slice::from_ref(&input), Some(&temb), None)
+                    .is_err()
             );
         }
         Ok(())

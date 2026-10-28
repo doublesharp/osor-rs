@@ -7,7 +7,7 @@
 
   An experimental library for OSOR SDXL-Inpainting Phase II inference.
 
-  ![Rust 1.95.0](https://img.shields.io/badge/Rust-1.95.0-C94B2C?style=flat-square) ![License MIT](https://img.shields.io/badge/license-MIT-343434?style=flat-square) ![Optional backends Metal, CUDA and WGPU](https://img.shields.io/badge/GPU-opt--in-343434?style=flat-square)
+  ![Rust 1.95.0](https://img.shields.io/badge/Rust-1.95.0-C94B2C?style=flat-square) ![Source licenses MIT and MIT-CMU](https://img.shields.io/badge/license-MIT%20%2B%20MIT--CMU-343434?style=flat-square) ![Optional backends Metal, CUDA and WGPU](https://img.shields.io/badge/GPU-opt--in-343434?style=flat-square)
 
   [Status](#status) · [Install](#install) · [Use from Rust](#use-from-rust) · [Model bundles](#model-bundles) · [Backends](#backends) · [Development](#development)
 
@@ -32,6 +32,8 @@ The named FP32 cases pass all 18 reference stages with measured, frozen toleranc
 CPU, Metal, and WGPU pass all 18 reference stages on an independent 80×96 input against frozen small-case FP32 limits. The real-model missing-weight rejection test also passes.
 
 An independent 640×384 photo passes all 18 stages on the same backends against a separately calibrated, frozen FP32 envelope with elementwise and RMS limits. Larger photos expose greater cross-backend FP32 sensitivity; this envelope is separate from the tighter small-case limits. These are bounded case results, not universal parity or image-quality claims. See the [qualification record](docs/qualification.md), [acceptance guide](tests/README.md), and [remaining work](docs/milestones.md).
+
+Additional photo cases at batches two/four, 88×104 and 512×512 currently exceed those frozen limits. Follow-up work fixes demonstrated CPU and Metal VAE batch corruption, but does not establish broader numerical acceptance. Admission bounds describe executable inputs, not a guarantee of reference agreement.
 
 Linux and Windows CPU cross-checks pass, but native runtime acceptance on those platforms and CUDA device qualification remain open. PhotoCraft integration is a separate project.
 
@@ -109,6 +111,8 @@ Supply independent standard-normal noise tensors for ordinary inference. `model.
 | `latent_alpha` | `[B, 1, H/8, W/8]` | Alpha used for latent blending |
 
 The image already includes alpha blending **in latent space before decoding**. The library returns the full image without RGB paste-back. Restricting it to the original mask can discard intended shadow or reflection removal; applications must choose and validate their compositing policy.
+
+On the current unreleased checkout, `preprocess::resize_reference_inputs` applies the reference CLI's dimension policy, bicubic RGB resize, and nearest-neighbor mask resize to raw RGB8 images and grayscale masks. After inference, quantize the result and use `reference_output_rgb8` to restore the original dimensions, optionally compositing with the predicted alpha. These native Rust byte helpers match the measured Pillow 13.0.0 corpus; see [preprocessing](docs/preprocessing.md) for usage and limits. The tensor API also retains `pad_to_model_size` and `Padding::crop_result` for applications that choose padding instead of resampling.
 
 ### Loading and integrity
 
@@ -200,7 +204,7 @@ For WGPU, use `--features wgpu` and replace the final `metal` argument with `wgp
 | Backend | Cargo feature | Current boundary |
 |---|---|---|
 | CPU | Default | F32; portable source; macOS real-model execution |
-| CPU + Accelerate | `accelerate` | macOS only; Apple Accelerate matrix products; passes both qualification cases, but slower than the portable build on Candle 0.11 |
+| CPU + Accelerate | `accelerate` | macOS only; Apple Accelerate matrix products; passes both qualification cases; measure on the intended workload before enabling |
 | Metal | `metal` | macOS; M2 Max small-case and independent photo acceptance |
 | CUDA | `cuda` | Requires an NVIDIA device, compatible driver, toolkit, and host compiler; device acceptance pending |
 | WGPU | `wgpu` | F32; resident GPU graph with CPU staging; M2 Max small-case and independent photo acceptance |
@@ -214,7 +218,7 @@ WGPU keeps UNet and VAE activations on the GPU, while noise, mask, scheduler, an
 
 The port preserves posterior sampling, 8× max-pooled masks, timestep 400, nine-channel UNet input, added text/time conditioning, five-channel output, scheduler predicted-original computation, and latent alpha blending. See the [numerical contract](docs/reference-contract.md).
 
-On the measured 640×384 photo, warm inference averaged **0.74 s for upstream PyTorch MPS, 2.76 s for Rust Metal (11.3 GiB peak), 18.2 s for Rust WGPU, and 22.0 s for portable Rust CPU**. On the 80×96 input with four threads, Rust CPU averaged **1.52 s** against 1.00 s for PyTorch CPU. These are two-sample, shared-host observations from the `profiling` build, with loading excluded. Metal's remaining time is mostly VAE normalization, upsampling and convolution. See the [performance record](docs/performance.md) for first/warm timings, load time, memory, and measured bottlenecks.
+The unreleased follow-up measured **1.57 s warm Metal inference and 10.6 GiB peak process footprint** on the 640×384 photo. A separate 80×96 run measured **1.00 s on portable CPU and 0.67 s with Accelerate**. These are shared-host `profiling` observations with two or three warm samples and loading excluded, not formal benchmarks. Earlier v0.2.0 measurements and upstream comparisons remain in the [performance record](docs/performance.md). WGPU convolution remains a measured bottleneck; no further WGPU speedup is claimed.
 
 <details>
 <summary>Capture, compare, and profile stages</summary>
@@ -261,4 +265,4 @@ Keep models, reference source, tensors, images, captures, and reports outside Gi
 
 ## License
 
-Project code is MIT. Adapted Candle code retains its MIT notice; dependencies and upstream sources have their own terms. Model weights have separate licenses, and this repository does not embed or redistribute them. See [attribution](ATTRIBUTION.md), [artifact provenance](docs/artifacts.md), and the preserved license notices.
+Original project code is MIT. Adapted Candle code retains its MIT notice; the Pillow byte-resampling adaptation retains its [MIT-CMU notice](src/preprocess/LICENSE-PILLOW). The package records both source licenses. Dependencies and upstream sources have their own terms. Model weights have separate licenses, and this repository does not embed or redistribute them. See [attribution](ATTRIBUTION.md), [artifact provenance](docs/artifacts.md), and the preserved license notices.

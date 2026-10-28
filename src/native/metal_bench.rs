@@ -85,17 +85,26 @@ fn metal_decoder_elementwise_and_norm_costs() -> Result<()> {
             channels,
             VarBuilder::from_tensors(weights, DType::F32, &device),
         )?;
+        let old_group_norm = time(&device, 5, || Ok(norm.forward_reference(&xs)?))?;
         let group_norm = time(&device, 5, || Ok(norm.forward(&xs)?))?;
+        let old_norm_silu = time(&device, 5, || {
+            Ok(candle_nn::ops::silu(&norm.forward_reference(&xs)?)?)
+        })?;
+        let norm_silu = time(&device, 5, || Ok(norm.forward_silu(&xs)?))?;
         let silu = time(&device, 5, || Ok(candle_nn::ops::silu(&xs)?))?;
         let add = time(&device, 5, || Ok((&xs + &other)?))?;
-        let bias_add = time(&device, 5, || {
+        let old_bias_add = time(&device, 5, || {
             Ok(xs.broadcast_add(&bias.reshape((1, channels, 1, 1))?)?)
+        })?;
+        let bias_add = time(&device, 5, || {
+            Ok(super::vae_encoder::metal_ops::channel_bias(&xs, &bias)?)
         })?;
         let half = xs
             .narrow(2, 0, height / 2)?
             .narrow(3, 0, width / 2)?
             .contiguous()?;
-        let upsample = time(&device, 5, || Ok(half.upsample_nearest2d(height, width)?))?;
+        let old_upsample = time(&device, 5, || Ok(half.upsample_nearest2d(height, width)?))?;
+        let upsample = time(&device, 5, || Ok(super::vae_decoder::upsample_2x(&half)?))?;
         let weight = Tensor::randn(0f32, 0.05f32, (channels, channels, 3, 3), &device)?;
         let banded = time(&device, 3, || {
             Ok(super::columns::conv2d(
@@ -110,7 +119,7 @@ fn metal_decoder_elementwise_and_norm_costs() -> Result<()> {
             Ok(super::columns::conv2d(&xs, &weight, 1, 1, usize::MAX)?)
         })?;
         println!(
-            "C={channels} {height}x{width}: group norm {group_norm:.1} ms, silu {silu:.1} ms, add {add:.1} ms, bias add {bias_add:.1} ms, upsample {upsample:.1} ms, conv banded {banded:.1} ms, conv one band {whole:.1} ms"
+            "C={channels} {height}x{width}: group norm old {old_group_norm:.1} new {group_norm:.1} ms, norm+silu old {old_norm_silu:.1} new {norm_silu:.1} ms, silu {silu:.1} ms, add {add:.1} ms, bias old {old_bias_add:.1} new {bias_add:.1} ms, upsample old {old_upsample:.1} new {upsample:.1} ms, conv banded {banded:.1} ms, conv one band {whole:.1} ms"
         );
     }
     Ok(())

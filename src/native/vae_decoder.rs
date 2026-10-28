@@ -3,7 +3,7 @@
 //! `AutoEncoderKL` decoder (candle-transformers 0.9.1, MIT/Apache-2.0).
 
 use candle_core::Tensor;
-use candle_nn::{self as nn, Module, VarBuilder};
+use candle_nn::{Module, VarBuilder};
 
 use super::Architecture;
 use super::conv::{BandedConv2d, conv2d};
@@ -15,6 +15,25 @@ struct UpBlock {
     upsample: Option<BandedConv2d>,
 }
 
+pub(super) fn upsample_2x(xs: &Tensor) -> candle_core::Result<Tensor> {
+    let (_, _, height, width) = xs.dims4()?;
+    let height = height
+        .checked_mul(2)
+        .ok_or_else(|| candle_core::Error::Msg("upsample height overflow".into()))?;
+    let width = width
+        .checked_mul(2)
+        .ok_or_else(|| candle_core::Error::Msg("upsample width overflow".into()))?;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if xs.device().is_metal()
+        && xs.dtype() == candle_core::DType::F32
+        && xs.elem_count() > 0
+        && u32::try_from(xs.elem_count()).is_ok()
+    {
+        return super::vae_encoder::metal_ops::upsample_2x(xs);
+    }
+    xs.upsample_nearest2d(height, width)
+}
+
 impl UpBlock {
     fn forward(&self, input: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         let mut xs = input.clone();
@@ -24,16 +43,7 @@ impl UpBlock {
         }
         checkpoint()?;
         Ok(match &self.upsample {
-            Some(conv) => {
-                let (_, _, height, width) = xs.dims4()?;
-                let height = height
-                    .checked_mul(2)
-                    .ok_or_else(|| candle_core::Error::Msg("upsample height overflow".into()))?;
-                let width = width
-                    .checked_mul(2)
-                    .ok_or_else(|| candle_core::Error::Msg("upsample width overflow".into()))?;
-                conv.forward(&xs.upsample_nearest2d(height, width)?)?
-            }
+            Some(conv) => conv.forward(&upsample_2x(&xs)?)?,
             None => xs,
         })
     }
@@ -100,7 +110,7 @@ impl VaeDecoder {
         for block in &self.up {
             xs = block.forward(&xs, checkpoint)?;
         }
-        let xs = nn::ops::silu(&self.norm_out.forward(&xs)?)?;
+        let xs = self.norm_out.forward_silu(&xs)?;
         Ok(self.conv_out.forward(&xs)?)
     }
 }
@@ -110,7 +120,49 @@ mod tests {
     use super::*;
     use crate::native::BlockSpec;
     use candle_core::{DType, Device};
+    use candle_nn as nn;
     use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
+
+    fn check_upsample_reference(device: &Device) -> Result<()> {
+        // The narrow has an offset; transpose makes its spatial axes strided.
+        let source = Tensor::arange(0f32, 48f32, device)?
+            .reshape((3, 2, 4, 2))?
+            .narrow(0, 1, 2)?
+            .transpose(2, 3)?;
+        let values = source
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = upsample_2x(&source)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut expected = Vec::new();
+        for plane in values.chunks_exact(8) {
+            for row in plane.chunks_exact(4) {
+                for _ in 0..2 {
+                    for &value in row {
+                        expected.extend([value, value]);
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(upsample_2x(&source)?.dims(), &[2, 2, 4, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_upsample_matches_explicit_reference_for_batch_and_views() -> Result<()> {
+        check_upsample_reference(&Device::Cpu)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_nearest_upsample_matches_explicit_reference_for_batch_and_views() -> Result<()> {
+        check_upsample_reference(&Device::new_metal(0)?)
+    }
 
     #[test]
     fn decoder_matches_candle_autoencoder_with_single_pass_groups() -> Result<()> {

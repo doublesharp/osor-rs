@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Add native RGB8/grayscale preprocessing, output quantization, and optional
+  predicted-alpha paste-back matching the measured Pillow 13 corpus. Preserve
+  the MIT-CMU notice and declare `MIT AND MIT-CMU` for the combined source.
+- Optimize Metal F32 VAE normalization, bias addition and nearest upsampling.
+  Separate SiLU is retained after a fused candidate failed the frozen limits.
+- Use channel-major CPU F32 convolution throughout the UNet, preserving other
+  device and dtype paths. Accelerate remains opt-in.
+- Fix distinct-image VAE batches: materialize CPU attention projection inputs
+  and evaluate Metal VAE attention per image. Batch-one paths are preserved.
+- Return actionable errors if CPU convolution or bundle hashing workers cannot
+  be created, with injected-failure regressions.
+- Add deterministic exactness fixtures, an F64 attention oracle, Metal batch
+  regressions, and opt-in WGPU VAE operator timings.
+- Both original reference cases still pass all 18 stages on CPU, Metal and
+  WGPU. Broader photo/batch/resolution cases still exceed the unchanged frozen
+  limits; see [qualification](docs/qualification.md). No WGPU algorithm change
+  or universal numerical-accuracy claim is included.
+
 ## 0.2.0 — 2026-10-28
 
 All 18 reference stages pass on CPU, Metal and WGPU for both qualification

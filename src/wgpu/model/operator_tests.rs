@@ -1,7 +1,7 @@
 //! Small checkpoint-backed operator comparisons; none run without an explicit GPU request.
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
-use burn::tensor::Device as GpuDevice;
+use burn::tensor::{Device as GpuDevice, Tensor as GpuTensor, activation};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::stable_diffusion::{
@@ -11,7 +11,7 @@ use candle_transformers::models::stable_diffusion::{
 
 use super::super::{Weights, acquire_device, guarded, readback, upload};
 use super::layers::{
-    Attention, Conv, FixedCrossAttention, GroupNorm, LayerNorm, Linear, TimeEmbedding,
+    Attention, Conv, FixedCrossAttention, GroupNorm, LayerNorm, Linear, TimeEmbedding, upsample,
 };
 use crate::Result;
 
@@ -51,6 +51,78 @@ fn cpu(values: Vec<f32>, shape: &[usize]) -> Result<Tensor> {
 
 fn weight_map(map: Checkpoint, device: &GpuDevice) -> Weights {
     Weights::new(map, device)
+}
+
+// Opt-in timing only: all geometry is fixed to the named qualification cases.
+// The sync is inside the timed region; the initial dispatch is excluded from
+// the three warm samples, and no readback or model loading is timed.
+#[test]
+#[ignore = "requires a real GPU; synchronized VAE operator timing"]
+fn gpu_vae_operator_timings() -> Result<()> {
+    guarded("VAE operator timing", || {
+        let (device, adapter) = acquire_device(0)?;
+        let sync = || {
+            device.sync().map_err(|e| {
+                crate::Error::Unavailable(format!("WGPU timing synchronization failed: {e}"))
+            })
+        };
+        let mut reports = Vec::new();
+        for (case, c, h, w) in [
+            ("small_full", 128, 80, 96),
+            ("photo_full", 128, 384, 640),
+            ("photo_half", 256, 192, 320),
+            ("photo_quarter", 512, 96, 160),
+            ("photo_eighth", 512, 48, 80),
+        ] {
+            let mut map = Checkpoint::new();
+            insert(&mut map, "norm.weight", &[c], vec![1.; c])?;
+            insert(&mut map, "norm.bias", &[c], vec![0.; c])?;
+            insert(
+                &mut map,
+                "conv.weight",
+                &[c, c, 3, 3],
+                vec![0.001; c * c * 9],
+            )?;
+            insert(&mut map, "conv.bias", &[c], vec![0.01; c])?;
+            let mut weights = weight_map(map, &device);
+            let norm = GroupNorm::new(&mut weights, "norm", c, 1e-6)?;
+            let conv = Conv::new(&mut weights, "conv", c, c, 3, 1, 1, false)?;
+            let input = GpuTensor::<4>::ones([1, c, h, w], &device) * 0.25;
+            let half = GpuTensor::<4>::ones([1, c, h / 2, w / 2], &device);
+            sync()?;
+            for name in ["group_norm", "silu", "conv_3x3", "upsample_2x"] {
+                let mut times = Vec::new();
+                for iteration in 0..4 {
+                    sync()?;
+                    let start = Instant::now();
+                    let output = match name {
+                        "group_norm" => norm.forward(input.clone()),
+                        "silu" => activation::silu(input.clone()),
+                        "conv_3x3" => conv.forward(input.clone()),
+                        _ => upsample(half.clone(), [h, w]),
+                    };
+                    sync()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.;
+                    std::hint::black_box(output);
+                    if iteration != 0 {
+                        times.push(elapsed);
+                    }
+                }
+                reports.push(serde_json::json!({
+                    "case": case, "operator": name, "shape": [1, c, h, w],
+                    "warm_ms": times,
+                }));
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "adapter": adapter, "dtype": "F32", "samples": reports,
+                "timing_scope": "synchronous dispatch; excludes readback and first dispatch"
+            }))?
+        );
+        Ok(())
+    })
 }
 
 #[test]

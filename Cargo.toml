@@ -3,7 +3,7 @@ name = "osor-rs"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "MIT AND MIT-CMU"
 publish = false
 description = "Native Rust OSOR SDXL Phase II inference"
 

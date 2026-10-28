@@ -99,6 +99,27 @@ impl BandedConv2d {
         match &self.bias {
             Some(bias) => {
                 let channels = bias.dims1()?;
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                if output.device().is_metal()
+                    && output.dtype() == candle_core::DType::F32
+                    && bias.dtype() == candle_core::DType::F32
+                {
+                    let (_, output_channels, height, width) = output.dims4()?;
+                    let spatial = height.checked_mul(width).ok_or_else(|| {
+                        candle_core::Error::Msg("convolution output size overflows".into())
+                    })?;
+                    if channels == output_channels
+                        && spatial > 0
+                        && output.elem_count() > 0
+                        && spatial.is_multiple_of(4)
+                        && u32::try_from(output.elem_count() / 4).is_ok()
+                    {
+                        let contiguous = output.contiguous()?;
+                        if contiguous.layout().start_offset().is_multiple_of(4) {
+                            return super::vae_encoder::metal_ops::channel_bias(&contiguous, bias);
+                        }
+                    }
+                }
                 output.broadcast_add(&bias.reshape((1, channels, 1, 1))?)
             }
             None => Ok(output),
@@ -147,6 +168,73 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device};
 
+    fn check_bias_reference(device: &Device) -> Result<()> {
+        let input = Tensor::arange(0f32, 72f32, device)?
+            .reshape((3, 3, 4, 2))?
+            .narrow(0, 1, 2)?
+            .transpose(2, 3)?;
+        let source = input
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let conv = BandedConv2d {
+            weight: Tensor::zeros((3, 3, 1, 1), DType::F32, device)?,
+            bias: Some(Tensor::from_vec(vec![1.0f32, -2.0, 0.5], 3, device)?),
+            padding: 0,
+            stride: 1,
+            kernel: 1,
+            max_scratch_elements: 1,
+        };
+        let actual = conv
+            .add_bias(input)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let biases = [1.0f32, -2.0, 0.5];
+        let mut expected = Vec::new();
+        for image in source.chunks_exact(24) {
+            for (plane, &bias) in image.chunks_exact(8).zip(&biases) {
+                expected.extend(plane.iter().map(|value| value + bias));
+            }
+        }
+        assert_eq!(actual, expected);
+        // A non-four-element plane and a non-vector-aligned offset both use
+        // Candle's broadcast fallback on Metal.
+        for (height, width, offset) in [(1, 5, 0), (2, 4, 1)] {
+            let count = 3 * height * width;
+            let source = Tensor::arange(0f32, (count + offset) as f32, device)?
+                .narrow(0, offset, count)?
+                .reshape((1, 3, height, width))?;
+            let actual = conv
+                .add_bias(source.clone())?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let source = source
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let mut expected = Vec::new();
+            for (plane, &bias) in source.chunks_exact(height * width).zip(&biases) {
+                expected.extend(plane.iter().map(|value| value + bias));
+            }
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn channel_bias_matches_explicit_reference_for_batch_and_views() -> Result<()> {
+        check_bias_reference(&Device::Cpu)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_channel_bias_matches_explicit_reference_for_batch_and_views() -> Result<()> {
+        check_bias_reference(&Device::new_metal(0)?)
+    }
+
     fn exact(a: &Tensor, b: &Tensor) -> Result<bool> {
         Ok(a.dims() == b.dims()
             && (a - b)?
@@ -176,11 +264,37 @@ mod tests {
             for dtype in [DType::F32, DType::F64] {
                 // F32 runs the channel-major column path; F64 runs the generic
                 // banded fallback used for other dtypes and devices.
-                let variables = nn::VarMap::new();
-                let vs = VarBuilder::from_varmap(&variables, dtype, device);
+                // Small dyadic coefficients make every product and sum
+                // exact in F32 and F64, including Accelerate. This isolates
+                // band geometry from backend-dependent reduction rounding.
+                let weight = Tensor::from_vec(
+                    (0..5 * 6 * kernel * kernel)
+                        .map(|i| ((i * 7 % 11) as f32 - 5.) / 32.)
+                        .collect::<Vec<_>>(),
+                    (5, 6, kernel, kernel),
+                    device,
+                )?
+                .to_dtype(dtype)?;
+                let bias =
+                    Tensor::from_vec(vec![-0.125f32, 0.0625, 0., 0.125, -0.0625], 5, device)?
+                        .to_dtype(dtype)?;
+                let vs = VarBuilder::from_tensors(
+                    std::collections::HashMap::from([
+                        (format!("{index}.weight"), weight),
+                        (format!("{index}.bias"), bias),
+                    ]),
+                    dtype,
+                    device,
+                );
                 let conv = conv2d(6, 5, kernel, stride, padding, vs.pp(index))?;
-                let input =
-                    Tensor::randn(0f32, 1f32, (2, 6, height, width), device)?.to_dtype(dtype)?;
+                let input = Tensor::from_vec(
+                    (0..2 * 6 * height * width)
+                        .map(|i| ((i * 13 % 41) as f32 - 20.) / 16.)
+                        .collect::<Vec<_>>(),
+                    (2, 6, height, width),
+                    device,
+                )?
+                .to_dtype(dtype)?;
                 let banded = conv.clone().with_scratch_limit(limit).forward(&input)?;
                 let one_band = conv
                     .clone()

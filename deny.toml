@@ -18,6 +18,8 @@ allow = [
     "BSL-1.0",
     "ISC",
     "MIT",
+    # Pillow byte-resampling adaptation; src/preprocess/LICENSE-PILLOW.
+    "MIT-CMU",
     # File-level copyleft, used unmodified by the optional WGPU stack
     # (buildid, colored).
     "MPL-2.0",

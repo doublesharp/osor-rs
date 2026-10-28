@@ -773,14 +773,15 @@ pub(crate) fn read_tensors(
         let tensor = if count >= PARALLEL_HASH_BYTES {
             // Hash and construct from the same immutable bytes concurrently;
             // the digest still covers exactly the bytes used for the tensor.
-            std::thread::scope(|scope| {
-                let hashing = scope.spawn(|| hasher.update(data));
-                let tensor = tensor_from_bytes(data, source_dtype, &info.shape, device, dtype);
-                hashing
-                    .join()
-                    .map_err(|_| artifact_error("tensor hashing thread failed"))?;
-                tensor
-            })?
+            tensor_with_parallel_hash(
+                data,
+                source_dtype,
+                &info.shape,
+                device,
+                dtype,
+                &mut hasher,
+                || Ok(()),
+            )?
         } else {
             hasher.update(data);
             tensor_from_bytes(data, source_dtype, &info.shape, device, dtype)?
@@ -800,6 +801,31 @@ pub(crate) fn read_tensors(
     budget.tensors = total_count;
     budget.tensor_bytes = total_bytes;
     Ok((result, hash))
+}
+
+fn tensor_with_parallel_hash(
+    data: &[u8],
+    source_dtype: DType,
+    shape: &[usize],
+    device: &Device,
+    dtype: DType,
+    hasher: &mut Sha256,
+    check_spawn: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Tensor> {
+    std::thread::scope(|scope| {
+        let hashing = check_spawn()
+            .and_then(|()| std::thread::Builder::new().spawn_scoped(scope, || hasher.update(data)))
+            .map_err(|error| {
+                artifact_error(format!(
+                    "unable to create tensor hashing worker; reduce concurrent loads or raise the OS thread limit: {error}"
+                ))
+            })?;
+        let tensor = tensor_from_bytes(data, source_dtype, shape, device, dtype);
+        hashing
+            .join()
+            .map_err(|_| artifact_error("tensor hashing thread failed"))?;
+        tensor
+    })
 }
 
 pub(crate) fn validate_plain_names(tensors: &HashMap<String, Tensor>, label: &str) -> Result<()> {
@@ -1317,6 +1343,36 @@ mod tests {
             }
         }
         assert!(accepted < 2000);
+        Ok(())
+    }
+
+    #[test]
+    fn hashing_thread_creation_failure_returns_an_actionable_error() -> Result<()> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"prior tensor bytes");
+        let before = hasher.clone().finalize();
+        let result = tensor_with_parallel_hash(
+            &1f32.to_le_bytes(),
+            DType::F32,
+            &[1],
+            &Device::Cpu,
+            DType::F32,
+            &mut hasher,
+            || Err(std::io::Error::other("injected thread limit")),
+        );
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(message.contains("tensor hashing worker"), "{message}");
+                assert!(message.contains("injected thread limit"), "{message}");
+            }
+            Ok(_) => {
+                return Err(artifact_error(
+                    "thread creation failure must return an error",
+                ));
+            }
+        }
+        assert_eq!(hasher.finalize(), before);
         Ok(())
     }
 

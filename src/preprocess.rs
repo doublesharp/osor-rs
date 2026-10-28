@@ -1,12 +1,23 @@
 //! Input geometry helpers, separate from the tensor inference API.
 //!
-//! [`reference_resize_dimensions`] plans the upstream CLI's resize. As an
-//! alternative that keeps source pixels unresampled, [`pad_to_model_size`]
-//! pads to the model's size rules and [`Padding::crop_result`] removes the
-//! padding from the output. Either choice changes results near the edges;
-//! applications pick and validate their policy.
+//! [`resize_reference_inputs`] processes raw RGB8 and grayscale mask bytes
+//! according to the upstream CLI; [`reference_output_rgb8`] restores the
+//! decoded result with optional predicted-alpha paste-back. These helpers are
+//! separate from the normalized NCHW F32 tensor inference API.
+//!
+//! As an alternative that keeps source pixels unresampled,
+//! [`pad_to_model_size`] pads to the model's size rules and
+//! [`Padding::crop_result`] removes the padding from the output. Either choice
+//! changes results near the edges; applications pick and validate the policy.
 
 use candle_core::{DType, Tensor};
+
+mod bytes;
+pub use bytes::{
+    ImageSize, MAX_PREPROCESS_AXIS, MAX_PREPROCESS_PIXELS, ReferenceInputs, quantize_alpha_f32,
+    quantize_rgb_chw_f32, reference_output_rgb8, resize_alpha8, resize_mask8,
+    resize_reference_inputs, resize_rgb8,
+};
 
 use crate::{
     Error, InferenceResult, Result,
@@ -116,7 +127,8 @@ impl Padding {
 /// Preserve the reference's short-side resize rule and round both axes up to 16.
 ///
 /// Smaller images are not scaled up to `resolution`. This plans dimensions;
-/// applications perform image/mask resampling and check inference admission.
+/// use [`resize_reference_inputs`] for byte resampling and check inference
+/// admission separately.
 pub fn reference_resize_dimensions(width: u32, height: u32, resolution: u32) -> Result<(u32, u32)> {
     if width == 0 || height == 0 || resolution == 0 {
         return Err(Error::InvalidInput(
