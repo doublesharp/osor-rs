@@ -22,42 +22,63 @@ impl<T: Read + Seek + ?Sized> ReadSeek for T {}
 
 /// The four already-open safetensors inputs. No paths are reopened.
 pub struct ConversionReaders<'a> {
+    /// Exported base UNet.
     pub base_unet: &'a mut dyn ReadSeek,
+    /// Exported base VAE.
     pub base_vae: &'a mut dyn ReadSeek,
+    /// Exported Phase II checkpoint.
     pub checkpoint: &'a mut dyn ReadSeek,
+    /// Exported fixed prompt embeddings.
     pub prompt: &'a mut dyn ReadSeek,
 }
 
 /// Trusted conversion metadata, expected input identities, and resource limits.
 #[derive(Clone, Debug)]
 pub struct ConversionOptions {
+    /// Base model provenance with an immutable revision.
     pub base_model_source: SourceProvenance,
+    /// VAE provenance with an immutable revision.
     pub vae_source: SourceProvenance,
+    /// Checkpoint provenance with an immutable revision.
     pub checkpoint_source: SourceProvenance,
+    /// Prompt provenance with an immutable revision.
     pub prompt_source: SourceProvenance,
+    /// Optional configuration provenance.
     pub config_source: Option<SourceProvenance>,
+    /// Trusted digests every input must match before it is decoded.
     pub expected_input_sha256: InputDigests,
+    /// DDPM scheduler configuration recorded in the manifest.
     pub scheduler: SchedulerConfig,
+    /// Input and output artifact limits.
     pub limits: ArtifactLimits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Identifies one of the four conversion inputs.
 pub enum ConversionInput {
+    /// Base UNet export.
     BaseUnet,
+    /// Base VAE export.
     BaseVae,
+    /// Phase II checkpoint export.
     Checkpoint,
+    /// Prompt embeddings export.
     Prompt,
 }
 
 /// Fixed output identities; manifest publication has its own final operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConversionOutput {
+    /// `unet.safetensors`.
     Unet,
+    /// `vae.safetensors`.
     Vae,
+    /// `prompt.safetensors`.
     Prompt,
 }
 
 impl ConversionOutput {
+    /// Fixed bundle file name for this output.
     pub const fn file_name(self) -> &'static str {
         match self {
             Self::Unet => crate::artifact::UNET_FILE,
@@ -70,27 +91,45 @@ impl ConversionOutput {
 /// Cancellation checkpoints run between bounded transfers and adapter merges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionEvent {
+    /// First pass: hashing an input against its trusted digest.
     VerifyingInput {
+        /// Input being verified.
         input: ConversionInput,
+        /// Bytes hashed so far.
         bytes_read: u64,
+        /// Input length in bytes.
         total_bytes: u64,
     },
+    /// Second pass: decoding a verified input's tensors.
     ReadingInput {
+        /// Input being decoded.
         input: ConversionInput,
+        /// Bytes decoded so far.
         bytes_read: u64,
+        /// Input length in bytes.
         total_bytes: u64,
     },
+    /// Merging rank-256 adapters into base weights.
     MergingAdapters {
+        /// Adapter targets merged so far.
         completed: usize,
+        /// Adapter targets to merge.
         total: usize,
     },
+    /// Constructing the native graph to check every required tensor.
     ValidatingModel,
+    /// Graph validation passed.
     ModelValidated,
+    /// Writing one bundle tensor file.
     WritingOutput {
+        /// Output being written.
         output: ConversionOutput,
+        /// Bytes written so far.
         bytes_written: u64,
+        /// Output length in bytes.
         total_bytes: u64,
     },
+    /// About to publish the manifest; the last cancellable point.
     PublishingManifest,
 }
 
@@ -102,9 +141,13 @@ pub enum ConversionEvent {
 /// Partial outputs and reconciliation after a publication error belong to the
 /// caller; conversion does not reopen paths, retry, or remove caller files.
 pub trait ConversionSink {
+    /// Exclusive writer for one output file.
     type Writer: Write;
+    /// Create `output` exclusively.
     fn create_new(&mut self, output: ConversionOutput) -> Result<Self::Writer>;
+    /// Complete and durably close `output`.
     fn finish(&mut self, output: ConversionOutput, writer: Self::Writer) -> Result<()>;
+    /// Publish the manifest bytes atomically and exclusively.
     fn publish_manifest(&mut self, bytes: &[u8]) -> Result<()>;
 }
 

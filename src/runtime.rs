@@ -21,14 +21,21 @@ use crate::{
 #[non_exhaustive]
 pub enum Backend {
     #[default]
+    /// Portable Candle CPU execution; F32 only.
     Cpu,
+    /// Candle Metal on macOS; requires the `metal` feature.
     Metal {
+        /// Metal device index.
         ordinal: usize,
     },
+    /// Candle CUDA; requires the `cuda` feature and an NVIDIA device.
     Cuda {
+        /// CUDA device index.
         ordinal: usize,
     },
+    /// Burn WGPU with CPU staging; requires the `wgpu` feature; F32 only.
     Wgpu {
+        /// Adapter index; only 0 is supported.
         ordinal: usize,
     },
 }
@@ -120,9 +127,13 @@ impl ModelBackend for RuntimeModel {
 }
 
 #[derive(Debug, Clone)]
+/// Backend, dtype and admission limits for loading a model. See also [`Osor::builder`].
 pub struct LoadOptions {
+    /// Compute backend; defaults to CPU.
     pub backend: Backend,
+    /// Model dtype; defaults to F32. CPU and WGPU require F32.
     pub dtype: DType,
+    /// Requested job admission limits, validated before any bundle I/O.
     pub limits: InferenceLimits,
 }
 
@@ -150,14 +161,20 @@ pub struct Osor {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+/// Synchronized time spent reaching one reference stage.
 pub struct StageTiming {
+    /// Pinned stage name, as in [`Stage::as_str`].
     pub stage: String,
+    /// Milliseconds since the previous stage completed.
     pub elapsed_ms: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+/// Stage timings for one profiled inference.
 pub struct InferenceProfile {
+    /// Wall-clock milliseconds for the whole job, including synchronization.
     pub total_ms: f64,
+    /// Per-stage timings in observer order.
     pub stages: Vec<StageTiming>,
 }
 
@@ -269,10 +286,12 @@ impl Osor {
         )
     }
 
+    /// Load the bundle at `path` on CPU in F32 with default limits.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         Self::load_with_options(path, LoadOptions::default())
     }
 
+    /// Load the bundle at `path` with explicit backend, dtype and limits.
     pub fn load_with_options(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
         Self::load_internal(path.as_ref(), options, None, &ArtifactLimits::default())
     }
@@ -365,14 +384,17 @@ impl Osor {
         })
     }
 
+    /// Validated manifest of the loaded bundle.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
+    /// Device that inference inputs must be on. For WGPU this is the CPU staging device.
     pub fn device(&self) -> &Device {
         &self.device
     }
 
+    /// Backend selected at load.
     pub fn backend(&self) -> Backend {
         self.backend
     }
@@ -382,6 +404,7 @@ impl Osor {
         &self.compute_device
     }
 
+    /// Model dtype; posterior and diffusion noise must use it.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
@@ -398,6 +421,8 @@ impl Osor {
         self.pipeline.infer(input)
     }
 
+    /// Run one job, reporting each reference stage in order. Return
+    /// [`Error::Cancelled`] from `observer` to stop between stages.
     pub fn infer_with_observer(
         &self,
         input: InferenceInput<'_>,

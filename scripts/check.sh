@@ -7,3 +7,4 @@ cd "$script_dir/.."
 "$script_dir/cargo.sh" clippy --locked --all-targets -- -D warnings
 "$script_dir/cargo.sh" test --locked --all-targets
 "$script_dir/cargo.sh" test --locked --doc
+RUSTDOCFLAGS="-D warnings" "$script_dir/cargo.sh" doc --locked --no-deps

@@ -7,8 +7,12 @@ use candle_core::{DType, Tensor};
 /// Backends bind the bundle's fixed prompt and pooled embeddings when they are
 /// constructed; `denoise` receives only per-job inputs.
 pub trait ModelBackend {
+    /// Return the raw eight-channel posterior mean and log-variance for a
+    /// normalized `[-1, 1]` image.
     fn encode_moments(&self, image: &Tensor) -> Result<Tensor>;
+    /// Return four denoising channels followed by the alpha logit.
     fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor>;
+    /// Decode unscaled four-channel latents into raw RGB.
     fn decode(&self, latents: &Tensor) -> Result<Tensor>;
 }
 
@@ -31,7 +35,9 @@ pub(crate) fn valid_image_axis(axis: usize) -> bool {
 /// Limits apply before model execution and include the batch in pixel counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InferenceLimits {
+    /// Largest accepted batch, in `1..=MAX_BATCH`.
     pub max_batch: usize,
+    /// Largest accepted `batch * height * width`, in `1..=MAX_PIXELS`.
     pub max_pixels: usize,
 }
 impl Default for InferenceLimits {
@@ -57,9 +63,13 @@ impl InferenceLimits {
 }
 
 #[derive(Debug, Clone)]
+/// Pinned recipe constants and admission limits for a [`Pipeline`].
 pub struct PipelineConfig {
+    /// DDPM timestep used for noising and prediction (400 for Phase II).
     pub timestep: usize,
+    /// Latent scaling factor applied after posterior sampling.
     pub vae_scaling_factor: f64,
+    /// Job admission limits.
     pub limits: InferenceLimits,
 }
 impl Default for PipelineConfig {
@@ -72,15 +82,24 @@ impl Default for PipelineConfig {
     }
 }
 
+/// One inference job. All tensors must be on the model device.
 pub struct InferenceInput<'a> {
+    /// RGB `[B, 3, H, W]` F32 in `[0, 1]`.
     pub image: &'a Tensor,
+    /// Removal mask `[B, 1, H, W]` F32 in `[0, 1]`; white means remove.
     pub mask: &'a Tensor,
+    /// Standard-normal VAE posterior noise `[B, 4, H/8, W/8]` in the model dtype.
     pub posterior_noise: &'a Tensor,
+    /// Standard-normal diffusion noise `[B, 4, H/8, W/8]` in the model dtype.
     pub diffusion_noise: &'a Tensor,
 }
+/// Output of one inference job.
 pub struct InferenceResult {
+    /// Full decoded RGB `[B, 3, H, W]` F32 in `[0, 1]`, alpha-blended in latent space.
     pub image: Tensor,
+    /// Predicted edit alpha upsampled to `[B, 1, H, W]` F32.
     pub alpha: Tensor,
+    /// Alpha `[B, 1, H/8, W/8]` used for latent blending.
     pub latent_alpha: Tensor,
 }
 
@@ -88,23 +107,41 @@ pub struct InferenceResult {
 /// without retaining tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stage {
+    /// Raw eight-channel VAE encoder output.
     PosteriorMoments,
+    /// First four posterior channels.
     PosteriorMean,
+    /// Last four posterior channels, clamped to `[-30, 20]`.
     PosteriorLogvar,
+    /// Mean plus standard deviation times posterior noise.
     PosteriorSample,
+    /// Posterior sample times the VAE scaling factor.
     OriginalLatent,
+    /// Mask max-pooled by 8.
     PooledMask,
+    /// Original latent noised at the pinned timestep.
     NoisyLatent,
+    /// Nine-channel noisy latent, pooled mask and original latent.
     UnetInput,
+    /// Fixed prompt embeddings, repeated per batch entry.
     Sequence,
+    /// Fixed pooled prompt embedding, repeated per batch entry.
     Pooled,
+    /// SDXL time IDs `[H, W, 0, 0, H, W]`.
     TimeIds,
+    /// Four denoising channels of the UNet output.
     DenoisingOutput,
+    /// Fifth UNet output channel.
     AlphaLogits,
+    /// Sigmoid of the alpha logits.
     LatentAlpha,
+    /// Scheduler predicted original sample.
     PredictedOriginal,
+    /// Alpha blend of predicted and original latents.
     BlendedLatent,
+    /// Decoded RGB mapped to `[0, 1]`.
     DecodedImage,
+    /// Alpha upsampled to image resolution.
     Alpha,
 }
 
@@ -184,6 +221,7 @@ pub const STAGES: &[&str] = &[
     "alpha",
 ];
 
+/// Backend-independent explicit-noise OSOR pipeline.
 pub struct Pipeline<B> {
     backend: B,
     scheduler: Scheduler,
@@ -229,6 +267,7 @@ impl<B: ModelBackend> Pipeline<B> {
         self.config.limits
     }
 
+    /// Validate the recipe constants, limits and fixed prompt embeddings.
     pub fn new(
         backend: B,
         scheduler: Scheduler,
@@ -258,10 +297,13 @@ impl<B: ModelBackend> Pipeline<B> {
         })
     }
 
+    /// Run one job without observing stages.
     pub fn infer(&self, input: InferenceInput<'_>) -> Result<InferenceResult> {
         self.infer_with_observer(input, &mut |_, _| Ok(()))
     }
 
+    /// Run one job, reporting each [`Stage`] in order. Return
+    /// [`Error::Cancelled`] from `observer` to stop between stages.
     pub fn infer_with_observer(
         &self,
         input: InferenceInput<'_>,

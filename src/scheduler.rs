@@ -8,16 +8,27 @@ use crate::{Error, Result};
 /// accepted during deserialization but does not participate in DDPM math.
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulerConfig {
+    /// Number of training timesteps.
     pub num_train_timesteps: usize,
+    /// First beta of the schedule.
     pub beta_start: f64,
+    /// Last beta of the schedule.
     pub beta_end: f64,
+    /// Beta schedule name, such as `scaled_linear`.
     pub beta_schedule: String,
+    /// Explicit betas overriding the schedule.
     pub trained_betas: Option<Vec<f64>>,
+    /// `epsilon`, `sample` or `v_prediction`.
     pub prediction_type: String,
+    /// Clamp predicted original samples.
     pub clip_sample: bool,
+    /// Clamp bound when `clip_sample` is set.
     pub clip_sample_range: f64,
+    /// Dynamic thresholding; must be false.
     pub thresholding: bool,
+    /// Dynamic thresholding ratio (unused when disabled).
     pub dynamic_thresholding_ratio: f64,
+    /// Dynamic thresholding bound (unused when disabled).
     pub sample_max_value: f64,
 }
 
@@ -113,6 +124,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Validate the configuration and precompute cumulative alphas.
     pub fn new(config: SchedulerConfig) -> Result<Self> {
         let invalid = |message: &str| Error::InvalidInput(format!("scheduler: {message}"));
         if config.num_train_timesteps == 0 || config.num_train_timesteps > 100_000 {
@@ -207,6 +219,7 @@ impl Scheduler {
         })
     }
 
+    /// Configuration used to build this scheduler.
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
     }
@@ -254,6 +267,7 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Noise `original` with explicit `noise` at `timestep`.
     pub fn add_noise(&self, original: &Tensor, noise: &Tensor, timestep: usize) -> Result<Tensor> {
         Self::validate_pair(original, noise)?;
         let a = self.alpha(timestep)?;
@@ -263,6 +277,7 @@ impl Scheduler {
         Ok((original.broadcast_mul(&original_scale)? + noise.broadcast_mul(&noise_scale)?)?)
     }
 
+    /// Predicted original sample from a noisy input and model output at `timestep`.
     pub fn predicted_original_sample(
         &self,
         noisy: &Tensor,

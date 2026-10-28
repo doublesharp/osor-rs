@@ -26,17 +26,29 @@ use crate::{Result, UPSTREAM_REVISION};
 /// which must not exist. Nothing is downloaded or deserialized as pickle.
 #[derive(Clone, Debug)]
 pub struct ConversionRequest {
+    /// Exported base SDXL inpainting UNet safetensors.
     pub base_unet: PathBuf,
+    /// Exported base VAE safetensors.
     pub base_vae: PathBuf,
+    /// Exported Phase II checkpoint safetensors.
     pub checkpoint: PathBuf,
+    /// Exported fixed prompt embeddings safetensors.
     pub prompt: PathBuf,
+    /// New bundle directory; must not exist, its parent must.
     pub output_dir: PathBuf,
+    /// Base model provenance with an immutable revision.
     pub base_model_source: SourceProvenance,
+    /// VAE provenance with an immutable revision.
     pub vae_source: SourceProvenance,
+    /// Checkpoint provenance with an immutable revision.
     pub checkpoint_source: SourceProvenance,
+    /// Prompt provenance with an immutable revision.
     pub prompt_source: SourceProvenance,
+    /// Optional configuration provenance.
     pub config_source: Option<SourceProvenance>,
+    /// DDPM scheduler configuration recorded in the manifest.
     pub scheduler: SchedulerConfig,
+    /// Input and output artifact limits.
     pub limits: ArtifactLimits,
 }
 

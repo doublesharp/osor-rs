@@ -20,19 +20,26 @@ use sha2::{Digest, Sha256};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::{Error, Result, UPSTREAM_REVISION};
 
+/// Pipeline identifier recorded in version 1 manifests.
 pub const PIPELINE: &str = "osor-sdxlinpainting-phase2";
+/// Bundle file holding merged UNet weights.
 pub const UNET_FILE: &str = "unet.safetensors";
+/// Bundle file holding VAE weights.
 pub const VAE_FILE: &str = "vae.safetensors";
+/// Bundle file holding the fixed prompt embeddings.
 pub const PROMPT_FILE: &str = "prompt.safetensors";
+/// Bundle manifest file, published last.
 pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// An immutable upstream repository revision and its license identifier or URL.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceProvenance {
+    /// Source repository URL or identifier.
     pub repository: String,
     /// A full 40- or 64-character hexadecimal commit/object identifier.
     pub revision: String,
+    /// License identifier or URL for this source.
     pub license: String,
 }
 
@@ -40,8 +47,11 @@ pub struct SourceProvenance {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleDigests {
+    /// SHA-256 of `unet.safetensors`.
     pub unet: String,
+    /// SHA-256 of `vae.safetensors`.
     pub vae: String,
+    /// SHA-256 of `prompt.safetensors`.
     pub prompt: String,
 }
 
@@ -49,9 +59,13 @@ pub struct BundleDigests {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputDigests {
+    /// SHA-256 of the exported base UNet.
     pub base_unet: String,
+    /// SHA-256 of the exported base VAE.
     pub base_vae: String,
+    /// SHA-256 of the exported Phase II checkpoint.
     pub checkpoint: String,
+    /// SHA-256 of the exported prompt embeddings.
     pub prompt: String,
 }
 
@@ -59,35 +73,59 @@ pub struct InputDigests {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// Manifest schema; must be 1.
     pub schema_version: u32,
+    /// Pinned upstream OSOR code revision.
     pub upstream_revision: String,
+    /// Must equal [`PIPELINE`].
     pub pipeline: String,
+    /// Base SDXL inpainting model provenance.
     pub base_model: SourceProvenance,
+    /// VAE provenance.
     pub vae_model: SourceProvenance,
+    /// Phase II checkpoint provenance.
     pub checkpoint: SourceProvenance,
+    /// Fixed prompt embedding provenance.
     pub prompt: SourceProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional configuration provenance.
     pub config: Option<SourceProvenance>,
+    /// Digests of the exact conversion inputs.
     pub input_sha256: InputDigests,
+    /// Digests of the bundle tensor files.
     pub sha256: BundleDigests,
+    /// Complete DDPM scheduler configuration.
     pub scheduler: SchedulerConfig,
+    /// Pinned timestep; must be 400.
     pub timestep: usize,
+    /// Pinned VAE scaling factor; must be 0.13025.
     pub vae_scaling_factor: f64,
+    /// Merged LoRA rank; must be 256.
     pub adapter_rank: usize,
+    /// Merged LoRA alpha; must be 256.
     pub adapter_alpha: f64,
 }
 
 /// Limits apply before tensor allocation. Applications may lower or raise them.
 #[derive(Clone, Debug)]
 pub struct ArtifactLimits {
+    /// Largest manifest file (default 1 MiB).
     pub max_manifest_bytes: u64,
+    /// Largest safetensors file (default 24 GiB).
     pub max_file_bytes: u64,
+    /// Largest safetensors JSON header (default 16 MiB).
     pub max_header_bytes: u64,
+    /// Most tensors across the files of one load (default 30,000).
     pub max_tensors: usize,
+    /// Largest single tensor in source or decoded bytes (default 1 GiB).
     pub max_tensor_bytes: u64,
+    /// Aggregate decoded tensor bytes across files (default 32 GiB); not a peak-memory bound.
     pub max_total_tensor_bytes: u64,
+    /// Largest tensor rank (default 8).
     pub max_rank: usize,
+    /// Largest single dimension (default 1,000,000).
     pub max_dimension: usize,
+    /// Longest tensor name (default 512 bytes).
     pub max_name_bytes: usize,
 }
 
@@ -109,10 +147,15 @@ impl Default for ArtifactLimits {
 
 /// Loaded tensor maps use unprefixed diffusers names.
 pub struct ModelBundle {
+    /// Validated manifest.
     pub manifest: Manifest,
+    /// Merged UNet tensors by diffusers name.
     pub unet: HashMap<String, Tensor>,
+    /// VAE tensors by diffusers name.
     pub vae: HashMap<String, Tensor>,
+    /// Fixed prompt embeddings `[1, 77, 2048]`.
     pub sequence: Tensor,
+    /// Fixed pooled prompt embedding `[1, 1280]`.
     pub pooled: Tensor,
 }
 
@@ -146,10 +189,12 @@ impl ModelBundle {
         )
     }
 
+    /// Load and verify a bundle with default limits and no manifest pin.
     pub fn load(path: impl AsRef<Path>, device: &Device, dtype: DType) -> Result<Self> {
         Self::load_with_limits(path, device, dtype, &ArtifactLimits::default())
     }
 
+    /// Load and verify a bundle with caller limits and no manifest pin.
     pub fn load_with_limits(
         path: impl AsRef<Path>,
         device: &Device,
@@ -268,6 +313,7 @@ fn reject_unknown_scheduler_fields(
 }
 
 impl Manifest {
+    /// Check the schema, pinned recipe constants, provenance and digests.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1
             || self.upstream_revision != UPSTREAM_REVISION

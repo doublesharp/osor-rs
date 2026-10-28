@@ -14,10 +14,14 @@ const MAX_COMPARISON_ELEMENTS: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Per-stage acceptance limits.
 pub struct Tolerance {
+    /// Absolute error allowance per element.
     pub absolute: f64,
+    /// Allowance per element, scaled by the reference magnitude.
     pub relative: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional cap on the stage's RMS error.
     pub maximum_root_mean_square_error: Option<f64>,
 }
 
@@ -40,19 +44,33 @@ impl Tolerance {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Error metrics and verdict for one stage.
 pub struct StageComparison {
+    /// Stage name.
     pub stage: String,
+    /// Compared shape.
     pub shape: Vec<usize>,
+    /// Reference tensor dtype.
     pub reference_dtype: String,
+    /// Actual tensor dtype.
     pub actual_dtype: String,
+    /// Number of compared elements.
     pub elements: usize,
+    /// Largest absolute error.
     pub max_absolute_error: f64,
+    /// Mean absolute error.
     pub mean_absolute_error: f64,
+    /// Root-mean-square error.
     pub root_mean_square_error: f64,
+    /// Whether the RMS error is within the optional cap.
     pub root_mean_square_error_passed: bool,
+    /// Largest error divided by the reference magnitude (diagnostic only).
     pub max_relative_error: f64,
+    /// Elements outside `absolute + relative * |reference|`.
     pub violations: usize,
+    /// Tolerance applied.
     pub tolerance: Tolerance,
+    /// No violations and the RMS cap, if any, holds.
     pub passed: bool,
 }
 

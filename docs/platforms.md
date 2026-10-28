@@ -29,8 +29,9 @@ export OSOR_SCRATCH_ROOT="$HOME/osor-scratch"
 ```
 
 The check script runs `fmt --all -- --check`, `clippy --locked --all-targets --
--D warnings`, `test --locked --all-targets`, and `test --locked --doc` through
-`scripts/cargo.sh`. A locked build requires the checked-in lockfile to match the
+-D warnings`, `test --locked --all-targets`, `test --locked --doc`, and
+`doc --locked --no-deps` with rustdoc warnings denied through
+`scripts/cargo.sh`. Every public item must be documented (`missing_docs`). A locked build requires the checked-in lockfile to match the
 manifest. Install `sccache` separately for local compiler caching; its cache
 location and service are host configuration, not model data.
 
