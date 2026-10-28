@@ -2,7 +2,7 @@
 
 These byte APIs are available in the unreleased checkout after v0.2.0.
 
-The tensor inference API accepts normalized NCHW F32 RGB and grayscale mask tensors. The byte helpers in `osor_rs::preprocess` reproduce the pinned upstream CLI's surrounding image operations using native Rust. They do not decode image files, download models, or load Python.
+The tensor inference API accepts normalized NCHW F32 RGB and grayscale mask tensors. The byte helpers in `osor::preprocess` reproduce the pinned upstream CLI's surrounding image operations using native Rust. They do not decode image files, download models, or load Python.
 
 Call `resize_reference_inputs(rgb, image_size, mask, mask_size, resolution)` with tightly packed interleaved RGB8 and grayscale mask bytes. It applies `reference_resize_dimensions`, bicubic RGB resizing, and nearest-neighbor mask resizing. The mask may have different source dimensions. Grayscale mask values are preserved; white means removal. Convert the returned RGB bytes to planar `[1, 3, H, W]` F32 and divide by 255. Convert the returned mask to `[1, 1, H, W]` F32 and divide by 255. The inference pipeline performs the later RGB normalization to `[-1, 1]` itself.
 
@@ -11,7 +11,7 @@ The dimension policy rounds both axes up to multiples of 16. If the source short
 After inference, copy one image's F32 RGB and full-resolution predicted alpha to the host. `quantize_rgb_chw_f32` clamps finite RGB values to `[0, 1]`, multiplies by 255 in F32, truncates, and interleaves the channels. `quantize_alpha_f32` validates `[0, 1]` and truncates the same way. Quantize **before** resizing back, as the upstream CLI does.
 
 ```rust
-use osor_rs::{Result, preprocess::{ImageSize, reference_output_rgb8}};
+use osor::{Result, preprocess::{ImageSize, reference_output_rgb8}};
 
 fn restore(
     generated_rgb8: &[u8],

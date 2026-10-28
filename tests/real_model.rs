@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use osor_rs::{
+use osor::{
     Backend, DType, Device, Error, InferenceInput, LoadOptions, Osor, Result,
     artifact::{ArtifactLimits, Manifest, ModelBundle},
     conversion::{
@@ -120,7 +120,7 @@ fn reference(backend: Backend) -> Result<()> {
             "tolerances":tolerance_path.to_string_lossy(), "model_sha256":model.manifest().sha256,
             "expected_manifest_sha256":expected_manifest_sha256,
             "max_decoded_bytes":max_decoded_bytes,
-            "upstream_revision":osor_rs::UPSTREAM_REVISION, "comparisons":reports,
+            "upstream_revision":osor::UPSTREAM_REVISION, "comparisons":reports,
         }))?
     );
     if let Some(output) = std::env::var_os("OSOR_TEST_ACTUAL_CAPTURE") {

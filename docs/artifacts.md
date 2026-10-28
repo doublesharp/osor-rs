@@ -77,7 +77,7 @@ The application implements this output boundary:
 
 ```rust
 use std::io::Write;
-use osor_rs::{Result, conversion::ConversionOutput};
+use osor::{Result, conversion::ConversionOutput};
 
 trait ConversionSink {
     type Writer: Write;
@@ -87,7 +87,7 @@ trait ConversionSink {
 }
 ```
 
-Implement the library's `osor_rs::conversion::ConversionSink` trait; the
+Implement the library's `osor::conversion::ConversionSink` trait; the
 declaration above shows its signatures. `ConversionOutput::{Unet,Vae,Prompt}`
 maps to the fixed bundle filenames through `file_name()`. The caller creates
 each writer exclusively through its held directory, performs durability checks

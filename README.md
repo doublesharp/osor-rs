@@ -35,7 +35,7 @@ The numerical recipe is pinned to [OSOR revision `d5b68e8`](https://github.com/Z
 Use the pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml). Add the Git dependency and commit your `Cargo.lock` to retain its resolved revision:
 
 ```toml
-[dependencies.osor-rs]
+[dependencies.osor]
 git = "https://github.com/doublesharp/osor-rs"
 branch = "main"
 # features = ["metal"]  # Enable for macOS Metal.
@@ -48,9 +48,9 @@ See the [changelog](CHANGELOG.md) for release history and API changes.
 
 ```toml
 [dependencies]
-osor-rs = { path = "../osor-rs" }
+osor = { path = "../osor-rs" }
 # Optional macOS GPU build:
-# osor-rs = { path = "../osor-rs", features = ["metal"] }
+# osor = { path = "../osor-rs", features = ["metal"] }
 ```
 
 </details>
@@ -62,7 +62,7 @@ Install a [model bundle](#model-bundles) locally before loading the model.
 Load an `Osor` once with `Osor::load(bundle_path)` or `Osor::builder(bundle_path)...load()` and retain it across jobs. A loaded model is `Send + Sync`. Pass it and your tensors into synchronous inference:
 
 ```rust
-use osor_rs::{InferenceInput, InferenceResult, Osor, Result, Tensor};
+use osor::{InferenceInput, InferenceResult, Osor, Result, Tensor};
 
 fn remove_object(
     model: &Osor,
@@ -91,7 +91,7 @@ Inputs are NCHW tensors on `model.device()`:
 
 Height and width must be multiples of eight in **32..=1024**. CPU, Metal, and CUDA support batches up to four. WGPU supports batch one and at most **262,144 pixels**, including rectangular inputs. Configure `InferenceLimits` with up to four images and **4,194,304** batch-inclusive pixels; `model.inference_limits()` reports the effective limits for the selected backend.
 
-Supply independent standard-normal noise tensors for inference. `model.seeded_noise(seed, batch, height, width)` generates both from a `u64` seed with a versioned, platform-independent algorithm (see `osor_rs::noise`). Store the seed to reproduce noise within the library, or retain the explicit tensors for comparisons across frameworks.
+Supply independent standard-normal noise tensors for inference. `model.seeded_noise(seed, batch, height, width)` generates both from a `u64` seed with a versioned, platform-independent algorithm (see `osor::noise`). Store the seed to reproduce noise within the library, or retain the explicit tensors for comparisons across frameworks.
 
 `InferenceResult` contains:
 
@@ -110,7 +110,7 @@ The image includes alpha blending **in latent space before decoding**. The full 
 `Osor::builder` collects every load option:
 
 ```rust
-use osor_rs::{Backend, Osor, Result, artifact::ArtifactLimits};
+use osor::{Backend, Osor, Result, artifact::ArtifactLimits};
 
 fn load_pinned(bundle: &str, trusted_manifest_sha256: &str) -> Result<Osor> {
     Osor::builder(bundle)

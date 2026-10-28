@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rename the Cargo package from `osor-rs` to `osor`; update dependency keys
+  and Rust imports from `osor_rs` to `osor`. The repository remains `osor-rs`.
 - Stabilize tiny-model batch checks with deterministic parameters and distinct,
   reordered images, retaining the existing F32 tolerance and conditioning checks.
 - Bound native UNet and VAE attention score tensors to 256 MiB each by

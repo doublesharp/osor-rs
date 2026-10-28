@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, env, path::PathBuf};
 
-use osor_rs::{Error, InferenceInput, Osor, Result, Tensor, tensor_io};
+use osor::{Error, InferenceInput, Osor, Result, Tensor, tensor_io};
 
 const USAGE: &str = "Usage: local_inference BUNDLE INPUT.safetensors OUTPUT.safetensors\n\
 INPUT must contain image, mask, posterior_noise and diffusion_noise.\n\

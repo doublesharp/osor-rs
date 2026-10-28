@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use osor_rs::{
+use osor::{
     Backend, DType, Error, InferenceInput, LoadOptions, Osor, Result, Tensor,
     artifact::{ArtifactLimits, SourceProvenance},
     conversion::{ConversionRequest, convert},
@@ -146,7 +146,7 @@ fn run(args: Vec<OsString>) -> Result<()> {
             let result = model.infer_with_observer(input, &mut |stage, tensor| {
                 model.device().synchronize()?;
                 let now = Instant::now();
-                timings.push(osor_rs::runtime::StageTiming {
+                timings.push(osor::runtime::StageTiming {
                     stage: stage.as_str().into(),
                     elapsed_ms: now.duration_since(previous).as_secs_f64() * 1000.0,
                 });
@@ -174,7 +174,7 @@ fn run(args: Vec<OsString>) -> Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "backend":format!("{backend:?}"), "dtype":"F32", "load_ms":load_ms,
                     "inference_ms":inference_ms, "stages":timings,
-                    "upstream_revision":osor_rs::UPSTREAM_REVISION,
+                    "upstream_revision":osor::UPSTREAM_REVISION,
                     "model_sha256":model.manifest().sha256,
                     "compute_device":model.compute_device_description(),
                     "profiling_synchronizes_each_stage":true,
@@ -186,12 +186,12 @@ fn run(args: Vec<OsString>) -> Result<()> {
             let expected = tensor_io::load(
                 args.get(1)
                     .ok_or_else(|| Error::InvalidInput(USAGE.into()))?,
-                &osor_rs::Device::Cpu,
+                &osor::Device::Cpu,
             )?;
             let actual = tensor_io::load(
                 args.get(2)
                     .ok_or_else(|| Error::InvalidInput(USAGE.into()))?,
-                &osor_rs::Device::Cpu,
+                &osor::Device::Cpu,
             )?;
             let tolerances = read_json::<std::collections::BTreeMap<String, Tolerance>>(
                 args.get(3)

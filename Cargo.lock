@@ -4861,7 +4861,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "osor-rs"
+name = "osor"
 version = "0.2.0"
 dependencies = [
  "burn",

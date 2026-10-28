@@ -27,8 +27,8 @@ the prompt is no longer uploaded per job. Applications still own total memory
 admission and concurrency. Reuse a loaded `Osor` for repeated jobs.
 
 ```rust,ignore
-let model = osor_rs::Osor::load_with_options(bundle_path, osor_rs::LoadOptions {
-    backend: osor_rs::Backend::Wgpu { ordinal: 0 },
+let model = osor::Osor::load_with_options(bundle_path, osor::LoadOptions {
+    backend: osor::Backend::Wgpu { ordinal: 0 },
     ..Default::default()
 })?;
 ```

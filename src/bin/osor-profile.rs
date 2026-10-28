@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, ffi::OsString, time::Instant};
 
-use osor_rs::{Backend, Error, InferenceInput, LoadOptions, Osor, Result, Tensor, tensor_io};
+use osor::{Backend, Error, InferenceInput, LoadOptions, Osor, Result, Tensor, tensor_io};
 
 const USAGE: &str = "osor-profile BUNDLE INPUT.safetensors [cpu|metal|cuda|wgpu] [WARM_RUNS=3]\nWarm runs must be 1..=10. Uses F32 and caller-supplied noise; downloads nothing.\nThe final stage profile synchronizes after each stage; normal inference timings do not.";
 
@@ -95,7 +95,7 @@ fn run(mut arguments: impl Iterator<Item = OsString>) -> Result<()> {
             "stage_profile":profile, "version":env!("CARGO_PKG_VERSION"),
             "model_sha256":model.manifest().sha256,
             "compute_device":model.compute_device_description(),
-            "upstream_revision":osor_rs::UPSTREAM_REVISION,
+            "upstream_revision":osor::UPSTREAM_REVISION,
             "timing_scope":"synchronous inference including validation; excludes input file I/O and output serialization",
         }))?
     );

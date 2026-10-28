@@ -189,8 +189,8 @@ pub struct InferenceProfile {
 /// Configures and loads an [`Osor`]; created by [`Osor::builder`].
 ///
 /// ```no_run
-/// # fn main() -> osor_rs::Result<()> {
-/// use osor_rs::{Backend, Osor};
+/// # fn main() -> osor::Result<()> {
+/// use osor::{Backend, Osor};
 ///
 /// let model = Osor::builder("/path/to/bundle")
 ///     .backend(Backend::Cpu)
