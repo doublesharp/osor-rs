@@ -33,24 +33,37 @@ impl UnetConv2d {
 
 impl Module for UnetConv2d {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.forward_checked(input, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+}
+
+impl UnetConv2d {
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        checkpoint: crate::pipeline::Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        checkpoint()?;
         if !input.device().is_cpu()
             || input.dtype() != DType::F32
             || self.0.weight().dtype() != DType::F32
         {
-            return self.0.forward(input);
+            return Ok(self.0.forward(input)?);
         }
         let config = self.0.config();
-        let output = super::columns::conv2d(
+        let output = super::columns::conv2d_checked(
             input,
             self.0.weight(),
             config.stride,
             config.padding,
             MAX_SCRATCH_ELEMENTS,
+            checkpoint,
         )?;
-        match self.0.bias() {
-            Some(bias) => output.broadcast_add(&bias.reshape((1, bias.dims1()?, 1, 1))?),
-            None => Ok(output),
-        }
+        Ok(match self.0.bias() {
+            Some(bias) => output.broadcast_add(&bias.reshape((1, bias.dims1()?, 1, 1))?)?,
+            None => output,
+        })
     }
 }
 

@@ -3,7 +3,7 @@
 //! `AutoEncoderKL` decoder (candle-transformers 0.9.1, MIT/Apache-2.0).
 
 use candle_core::Tensor;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 
 use super::Architecture;
 use super::conv::{BandedConv2d, conv2d};
@@ -39,11 +39,11 @@ impl UpBlock {
         let mut xs = input.clone();
         for resnet in &self.resnets {
             checkpoint()?;
-            xs = resnet.forward(&xs)?;
+            xs = resnet.forward_checked(&xs, checkpoint)?;
         }
         checkpoint()?;
         Ok(match &self.upsample {
-            Some(conv) => conv.forward(&upsample_2x(&xs)?)?,
+            Some(conv) => conv.forward_checked(&upsample_2x(&xs)?, checkpoint)?,
             None => xs,
         })
     }
@@ -102,16 +102,15 @@ impl VaeDecoder {
 
     /// Decode unscaled latents into raw RGB in approximately [-1, 1].
     pub(super) fn forward(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
-        let xs = self
-            .conv_in
-            .forward(&self.post_quant_conv.forward(latents)?)?;
+        let xs = self.post_quant_conv.forward_checked(latents, checkpoint)?;
+        let xs = self.conv_in.forward_checked(&xs, checkpoint)?;
         checkpoint()?;
-        let mut xs = self.mid.forward(&xs, None)?;
+        let mut xs = self.mid.forward_checked(&xs, checkpoint)?;
         for block in &self.up {
             xs = block.forward(&xs, checkpoint)?;
         }
         let xs = self.norm_out.forward_silu(&xs)?;
-        Ok(self.conv_out.forward(&xs)?)
+        self.conv_out.forward_checked(&xs, checkpoint)
     }
 }
 

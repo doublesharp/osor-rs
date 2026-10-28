@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Bound native UNet and VAE attention score tensors to 256 MiB each by
+  slicing query rows; weights and other activations have separate costs.
+- Check cancellation between transformer operations, attention slices, and
+  convolution bands. Individual kernels and opaque Candle blocks finish first.
+- Check WGPU adapter availability before loading model weights and retain the
+  selected device generation for graph construction.
+- Validate accelerator tensors with device reductions and scalar readback,
+  preserving finite/range checks and checking available storage bounds before
+  conversion or dispatch.
 - Add native RGB8/grayscale preprocessing, output quantization, and optional
   predicted-alpha paste-back matching the measured Pillow 13 corpus. Preserve
   the MIT-CMU notice and declare `MIT AND MIT-CMU` for the combined source.

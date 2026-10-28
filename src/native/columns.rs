@@ -294,25 +294,32 @@ kernel void osor_im2col_f32(
 
 /// `weight [out, channels, k, k]` convolution through banded column GEMMs.
 /// `max_scratch_elements` bounds one band of columns.
-pub(super) fn conv2d(
+pub(super) fn conv2d_checked(
     input: &Tensor,
     weight: &Tensor,
     stride: usize,
     padding: usize,
     max_scratch_elements: usize,
-) -> Result<Tensor> {
+    checkpoint: crate::pipeline::Checkpoint<'_>,
+) -> crate::Result<Tensor> {
+    checkpoint()?;
     let (batch, channels, height, width) = input.dims4()?;
     let (out_channels, weight_channels, kernel, kernel_width) = weight.dims4()?;
     if weight_channels != channels || kernel != kernel_width || kernel == 0 || stride == 0 {
-        candle_core::bail!("column convolution needs a square kernel matching the input")
+        return Err(candle_core::Error::Msg(
+            "column convolution needs a square kernel matching the input".into(),
+        )
+        .into());
     }
     if input.dtype() != DType::F32 || weight.dtype() != DType::F32 {
-        candle_core::bail!("column convolution requires F32")
+        return Err(candle_core::Error::Msg("column convolution requires F32".into()).into());
     }
     let padded_height = height + 2 * padding;
     let padded_width = width + 2 * padding;
     if padded_height < kernel || padded_width < kernel {
-        candle_core::bail!("convolution input is smaller than its kernel")
+        return Err(
+            candle_core::Error::Msg("convolution input is smaller than its kernel".into()).into(),
+        );
     }
     let out_height = (padded_height - kernel) / stride + 1;
     let out_width = (padded_width - kernel) / stride + 1;
@@ -326,6 +333,7 @@ pub(super) fn conv2d(
     let weight = weight.reshape((out_channels, column_rows))?;
     let mut bands = Vec::with_capacity(out_height.div_ceil(rows_per_band));
     for row_start in (0..out_height).step_by(rows_per_band) {
+        checkpoint()?;
         let rows = rows_per_band.min(out_height - row_start);
         let columns = input.apply_op1_no_bwd(&Im2Col {
             kernel,
@@ -337,6 +345,7 @@ pub(super) fn conv2d(
         })?;
         let mut outputs = Vec::with_capacity(batch);
         for b in 0..batch {
+            checkpoint()?;
             outputs.push(weight.matmul(&columns.get(b)?)?);
         }
         let band = if batch == 1 {
@@ -349,19 +358,61 @@ pub(super) fn conv2d(
         };
         bands.push(band.reshape((batch, out_channels, rows, out_width))?);
     }
-    if bands.len() == 1 {
+    checkpoint()?;
+    Ok(if bands.len() == 1 {
         bands
             .pop()
-            .ok_or_else(|| candle_core::Error::Msg("missing column band".into()))
+            .ok_or_else(|| candle_core::Error::Msg("missing column band".into()))?
     } else {
-        Tensor::cat(&bands, 2)
-    }
+        Tensor::cat(&bands, 2)?
+    })
+}
+
+#[cfg(test)]
+pub(super) fn conv2d(
+    input: &Tensor,
+    weight: &Tensor,
+    stride: usize,
+    padding: usize,
+    max_scratch_elements: usize,
+) -> Result<Tensor> {
+    conv2d_checked(
+        input,
+        weight,
+        stride,
+        padding,
+        max_scratch_elements,
+        &|| Ok(()),
+    )
+    .map_err(|error| candle_core::Error::Msg(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn native_convolution_cancels_between_output_bands() -> crate::Result<()> {
+        use std::cell::Cell;
+        let device = &Device::Cpu;
+        let input = Tensor::ones((1, 2, 8, 8), DType::F32, device)?;
+        let weight = Tensor::ones((2, 2, 3, 3), DType::F32, device)?;
+        let calls = Cell::new(0);
+        let result = conv2d_checked(&input, &weight, 1, 1, 2 * 3 * 3 * 8, &|| {
+            calls.set(calls.get() + 1);
+            // The first band has completed: entry, first-band, and its
+            // batch GEMM checkpoints precede the next-band checkpoint.
+            if calls.get() == 4 {
+                Err(crate::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(calls.get(), 4);
+        Ok(())
+    }
 
     #[test]
     fn thread_creation_failure_returns_an_actionable_error() -> Result<()> {

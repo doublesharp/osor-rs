@@ -45,11 +45,26 @@ impl BandedConv2d {
 
 impl Module for BandedConv2d {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_checked(xs, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+}
+
+impl BandedConv2d {
+    pub(super) fn forward_checked(
+        &self,
+        xs: &Tensor,
+        checkpoint: crate::pipeline::Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        checkpoint()?;
         let (batch, channels, height, width) = xs.dims4()?;
         let padded_height = height + 2 * self.padding;
         let padded_width = width + 2 * self.padding;
         if padded_height < self.kernel || padded_width < self.kernel {
-            candle_core::bail!("convolution input is smaller than its kernel")
+            return Err(candle_core::Error::Msg(
+                "convolution input is smaller than its kernel".into(),
+            )
+            .into());
         }
         let out_height = (padded_height - self.kernel) / self.stride + 1;
         let out_width = (padded_width - self.kernel) / self.stride + 1;
@@ -61,14 +76,15 @@ impl Module for BandedConv2d {
         {
             // Candle's Metal im2col and NCHW copy dominate its convolution
             // time; channel-major columns feed its fast GEMM directly.
-            let output = super::columns::conv2d(
+            let output = super::columns::conv2d_checked(
                 xs,
                 &self.weight,
                 self.stride,
                 self.padding,
                 self.max_scratch_elements,
+                checkpoint,
             )?;
-            return self.add_bias(output);
+            return Ok(self.add_bias(output)?);
         }
         let output = if rows_per_band >= out_height {
             xs.conv2d(&self.weight, self.padding, self.stride, 1, 1)?
@@ -81,6 +97,7 @@ impl Module for BandedConv2d {
             };
             let mut bands = Vec::with_capacity(out_height.div_ceil(rows_per_band));
             for start in (0..out_height).step_by(rows_per_band) {
+                checkpoint()?;
                 let rows = rows_per_band.min(out_height - start);
                 let input_rows = (rows - 1) * self.stride + self.kernel;
                 let band = padded
@@ -90,7 +107,8 @@ impl Module for BandedConv2d {
             }
             Tensor::cat(&bands, 2)?
         };
-        self.add_bias(output)
+        checkpoint()?;
+        Ok(self.add_bias(output)?)
     }
 }
 
@@ -167,6 +185,35 @@ pub(super) fn conv2d(
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
+
+    #[test]
+    fn checked_generic_convolution_cancels_after_the_first_band() -> crate::Result<()> {
+        use std::cell::Cell;
+        let device = &Device::Cpu;
+        let variables = nn::VarMap::new();
+        let conv = conv2d(
+            2,
+            3,
+            3,
+            1,
+            1,
+            VarBuilder::from_varmap(&variables, DType::F64, device),
+        )?
+        .with_scratch_limit(1);
+        let input = Tensor::ones((1, 2, 8, 8), DType::F64, device)?;
+        let calls = Cell::new(0);
+        let result = conv.forward_checked(&input, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(crate::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(calls.get(), 3);
+        Ok(())
+    }
 
     fn check_bias_reference(device: &Device) -> Result<()> {
         let input = Tensor::arange(0f32, 72f32, device)?

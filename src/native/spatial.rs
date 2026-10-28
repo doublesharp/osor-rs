@@ -4,6 +4,7 @@
 //! Keys and values for the fixed prompt are computed once at construction,
 //! so the `attn2.to_k` and `attn2.to_v` weights are not retained.
 use super::transformer::FeedForward;
+use crate::pipeline::Checkpoint;
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{self as nn, Module, VarBuilder};
 
@@ -27,11 +28,22 @@ fn scaled_keys_t(keys: &Tensor, scale: f64) -> Result<Tensor> {
 }
 
 /// Softmax attention computed in F32, returning the query dtype.
-fn attend(query: &Tensor, keys_t: &Tensor, values: &Tensor, heads: usize) -> Result<Tensor> {
+fn attend(
+    query: &Tensor,
+    keys_t: &Tensor,
+    values: &Tensor,
+    heads: usize,
+    checkpoint: Checkpoint<'_>,
+) -> crate::Result<Tensor> {
     let dtype = query.dtype();
-    let scores = query.to_dtype(DType::F32)?.matmul(keys_t)?;
-    let probabilities = nn::ops::softmax_last_dim(&scores)?;
-    merge_heads(&probabilities.matmul(values)?.to_dtype(dtype)?, heads)
+    let output = super::attention::attend(
+        &query.to_dtype(DType::F32)?,
+        keys_t,
+        values,
+        checkpoint,
+        nn::ops::softmax_last_dim,
+    )?;
+    Ok(merge_heads(&output.to_dtype(dtype)?, heads)?)
 }
 
 fn head_scale(channels: usize, heads: usize) -> Result<f64> {
@@ -61,7 +73,13 @@ impl SelfAttention {
             scale: head_scale(channels, heads)?,
         })
     }
+    #[cfg(test)]
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_checked(xs, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+    fn forward_checked(&self, xs: &Tensor, checkpoint: Checkpoint<'_>) -> crate::Result<Tensor> {
+        checkpoint()?;
         let query = split_heads(&self.query.forward(xs)?, self.heads)?;
         let context = xs.contiguous()?;
         let keys = split_heads(&self.key.forward(&context)?, self.heads)?;
@@ -71,8 +89,9 @@ impl SelfAttention {
             &scaled_keys_t(&keys, self.scale)?,
             &values.to_dtype(DType::F32)?,
             self.heads,
+            checkpoint,
         )?;
-        self.output.forward(&xs)
+        Ok(self.output.forward(&xs)?)
     }
 }
 
@@ -107,20 +126,27 @@ impl FixedCrossAttention {
             heads,
         })
     }
+    #[cfg(test)]
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_checked(xs, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+    fn forward_checked(&self, xs: &Tensor, checkpoint: Checkpoint<'_>) -> crate::Result<Tensor> {
+        checkpoint()?;
         let batch = xs.dim(0)?;
         let query = split_heads(&self.query.forward(xs)?, self.heads)?;
         let xs = if batch == 1 {
-            attend(&query, &self.keys_t, &self.values, self.heads)?
+            attend(&query, &self.keys_t, &self.values, self.heads, checkpoint)?
         } else {
             attend(
                 &query,
                 &self.keys_t.repeat((batch, 1, 1))?,
                 &self.values.repeat((batch, 1, 1))?,
                 self.heads,
+                checkpoint,
             )?
         };
-        self.output.forward(&xs)
+        Ok(self.output.forward(&xs)?)
     }
 }
 
@@ -144,10 +170,19 @@ impl TransformerBlock {
             norm3: nn::layer_norm(channels, 1e-5, vs.pp("norm3"))?,
         })
     }
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = (xs + self.self_attention.forward(&self.norm1.forward(xs)?)?)?;
-        let xs = (&xs + self.cross_attention.forward(&self.norm2.forward(&xs)?)?)?;
-        &xs + self.feed_forward.forward(&self.norm3.forward(&xs)?)?
+    fn forward_checked(&self, xs: &Tensor, checkpoint: Checkpoint<'_>) -> crate::Result<Tensor> {
+        checkpoint()?;
+        let xs = (xs
+            + self
+                .self_attention
+                .forward_checked(&self.norm1.forward(xs)?, checkpoint)?)?;
+        checkpoint()?;
+        let xs = (&xs
+            + self
+                .cross_attention
+                .forward_checked(&self.norm2.forward(&xs)?, checkpoint)?)?;
+        checkpoint()?;
+        Ok((&xs + self.feed_forward.forward(&self.norm3.forward(&xs)?)?)?)
     }
 }
 
@@ -186,7 +221,17 @@ impl SpatialTransformer {
             projection_out,
         })
     }
+    #[cfg(test)]
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.forward_checked(input, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        checkpoint()?;
         let (batch, channels, height, width) = input.dims4()?;
         let positions = height.checked_mul(width).ok_or_else(|| {
             candle_core::Error::Msg("spatial transformer dimensions overflow".into())
@@ -199,15 +244,17 @@ impl SpatialTransformer {
             .reshape((batch, positions, channels))?;
         let mut xs = self.projection_in.forward(&xs)?;
         for block in &self.blocks {
-            xs = block.forward(&xs)?;
+            checkpoint()?;
+            xs = block.forward_checked(&xs, checkpoint)?;
         }
+        checkpoint()?;
         let xs = self
             .projection_out
             .forward(&xs)?
             .reshape((batch, height, width, channels))?
             .t()?
             .transpose(1, 2)?;
-        xs + input
+        Ok((xs + input)?)
     }
 }
 
@@ -217,6 +264,34 @@ mod tests {
     use candle_core::{DType, Device};
     use candle_transformers::models::stable_diffusion::attention::CrossAttention;
     use std::collections::HashMap;
+
+    #[test]
+    fn native_transformer_cancels_inside_a_spatial_block() -> crate::Result<()> {
+        use std::cell::Cell;
+        let device = &Device::Cpu;
+        let variables = nn::VarMap::new();
+        let context = Tensor::zeros((1, 2, 8), DType::F32, device)?;
+        let model = SpatialTransformer::new(
+            VarBuilder::from_varmap(&variables, DType::F32, device),
+            32,
+            1,
+            &context,
+            3,
+        )?;
+        let input = Tensor::zeros((1, 32, 2, 3), DType::F32, device)?;
+        let calls = Cell::new(0);
+        let result = model.forward_checked(&input, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(crate::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(calls.get(), 2);
+        Ok(())
+    }
 
     fn identical(a: &Tensor, b: &Tensor) -> Result<bool> {
         Ok(a.dims() == b.dims()

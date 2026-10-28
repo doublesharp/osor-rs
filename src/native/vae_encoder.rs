@@ -131,14 +131,23 @@ impl Resnet {
         })
     }
 
-    pub(super) fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn forward_checked(
+        &self,
+        xs: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
+        checkpoint()?;
         let shortcut = match &self.shortcut {
-            Some(conv) => conv.forward(xs)?,
+            Some(conv) => conv.forward_checked(xs, checkpoint)?,
             None => xs.clone(),
         };
-        let hidden = self.conv1.forward(&self.norm1.forward_silu(xs)?)?;
-        let hidden = self.conv2.forward(&self.norm2.forward_silu(&hidden)?)?;
-        shortcut + hidden
+        let hidden = self
+            .conv1
+            .forward_checked(&self.norm1.forward_silu(xs)?, checkpoint)?;
+        let hidden = self
+            .conv2
+            .forward_checked(&self.norm2.forward_silu(&hidden)?, checkpoint)?;
+        Ok((shortcut + hidden)?)
     }
 }
 
@@ -191,15 +200,15 @@ impl DownBlock {
         let mut xs = input.clone();
         for resnet in &self.resnets {
             checkpoint()?;
-            xs = resnet.forward(&xs)?;
+            xs = resnet.forward_checked(&xs, checkpoint)?;
         }
         checkpoint()?;
         Ok(match &self.downsample {
-            Some(conv) => conv.forward(&xs.pad_with_zeros(D::Minus1, 0, 1)?.pad_with_zeros(
-                D::Minus2,
-                0,
-                1,
-            )?)?,
+            Some(conv) => conv.forward_checked(
+                &xs.pad_with_zeros(D::Minus1, 0, 1)?
+                    .pad_with_zeros(D::Minus2, 0, 1)?,
+                checkpoint,
+            )?,
             None => xs,
         })
     }
@@ -251,23 +260,34 @@ impl Attention {
         })
     }
 
+    #[cfg(test)]
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_checked(input, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+
+    fn forward_checked(&self, input: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+        checkpoint()?;
         let (batch, channels, height, width) = input.dims4()?;
         if batch > 1 && input.device().is_metal() {
             // Candle 0.11's batched Metal attention changes entries after
             // the first even when normalization and projections agree.
             // Keep each image on the qualified single-image device path.
             if batch > crate::pipeline::MAX_BATCH {
-                candle_core::bail!("VAE attention batch exceeds the inference limit")
+                return Err(candle_core::Error::Msg(
+                    "VAE attention batch exceeds the inference limit".into(),
+                )
+                .into());
             }
             let mut entries = Vec::new();
             entries.try_reserve_exact(batch).map_err(|error| {
                 candle_core::Error::Msg(format!("cannot allocate VAE attention batch: {error}"))
             })?;
             for entry in 0..batch {
-                entries.push(self.forward(&input.narrow(0, entry, 1)?)?);
+                checkpoint()?;
+                entries.push(self.forward_checked(&input.narrow(0, entry, 1)?, checkpoint)?);
             }
-            return Tensor::cat(&entries, 0);
+            return Ok(Tensor::cat(&entries, 0)?);
         }
         let tokens = height
             .checked_mul(width)
@@ -298,10 +318,14 @@ impl Attention {
             .unsqueeze(1)?
             .to_dtype(DType::F32)?;
         let scale = (self.channels as f64).powf(-0.25);
-        let scores = (query * scale)?.matmul(&(key.t()? * scale)?)?;
-        let probs = nn::ops::softmax(&scores, D::Minus1)?;
-        let xs = probs
-            .matmul(&value)?
+        let output = super::attention::attend(
+            &(query * scale)?,
+            &(key.t()? * scale)?,
+            &value,
+            checkpoint,
+            |scores| nn::ops::softmax(scores, D::Minus1),
+        )?;
+        let xs = output
             .to_dtype(input.dtype())?
             .transpose(1, 2)?
             .contiguous()?
@@ -311,7 +335,7 @@ impl Attention {
             .forward(&xs)?
             .t()?
             .reshape((batch, channels, height, width))?;
-        xs + input
+        Ok((xs + input)?)
     }
 }
 
@@ -330,13 +354,24 @@ impl MidBlock {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn forward(
         &self,
         xs: &Tensor,
         _temb: Option<&Tensor>,
     ) -> candle_core::Result<Tensor> {
-        self.second
-            .forward(&self.attention.forward(&self.first.forward(xs)?)?)
+        self.forward_checked(xs, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+
+    pub(super) fn forward_checked(
+        &self,
+        xs: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
+        let xs = self.first.forward_checked(xs, checkpoint)?;
+        let xs = self.attention.forward_checked(&xs, checkpoint)?;
+        self.second.forward_checked(&xs, checkpoint)
     }
 }
 
@@ -377,14 +412,15 @@ impl VaeEncoder {
     }
 
     pub(super) fn forward(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
-        let mut xs = self.conv_in.forward(image)?;
+        let mut xs = self.conv_in.forward_checked(image, checkpoint)?;
         for block in &self.down {
             xs = block.forward_checked(&xs, checkpoint)?;
         }
         checkpoint()?;
-        xs = self.mid.forward(&xs, None)?;
+        xs = self.mid.forward_checked(&xs, checkpoint)?;
         xs = self.norm_out.forward_silu(&xs)?;
-        Ok(self.quant_conv.forward(&self.conv_out.forward(&xs)?)?)
+        self.quant_conv
+            .forward_checked(&self.conv_out.forward_checked(&xs, checkpoint)?, checkpoint)
     }
 }
 

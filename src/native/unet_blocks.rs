@@ -4,8 +4,9 @@
 //! <https://github.com/huggingface/candle/blob/31f35b147389700ed2a178ee66a91c3cc25cc80d/candle-transformers/src/models/stable_diffusion/unet_2d_blocks.rs>.
 //! Used under the MIT option; see `LICENSE-CANDLE-MIT`.
 
+use crate::pipeline::Checkpoint;
 use candle_core::{D, DType, Result, Tensor};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 use candle_transformers::models::stable_diffusion::{
     resnet::ResnetBlock2DConfig,
     unet_2d_blocks::{DownBlock2D, DownBlock2DConfig, UpBlock2D, UpBlock2DConfig},
@@ -66,20 +67,33 @@ impl PlainDown {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn forward(
         &self,
         input: &Tensor,
         temb: Option<&Tensor>,
     ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_checked(input, temb, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        temb: Option<&Tensor>,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<(Tensor, Vec<Tensor>)> {
+        checkpoint()?;
         match self {
-            Self::Candle(block) => block.forward(input, temb),
+            Self::Candle(block) => Ok(block.forward(input, temb)?),
             Self::Cpu(block) => {
                 let mut xs = input.clone();
                 let mut saved = Vec::with_capacity(
                     block.resnets.len() + usize::from(block.downsample.is_some()),
                 );
                 for resnet in &block.resnets {
-                    xs = resnet.forward(&xs, temb)?;
+                    checkpoint()?;
+                    xs = resnet.forward_checked(&xs, temb, checkpoint)?;
                     saved.push(xs.clone());
                 }
                 if let Some(conv) = &block.downsample {
@@ -88,7 +102,7 @@ impl PlainDown {
                             .pad_with_zeros(D::Minus1, 0, 1)?
                             .pad_with_zeros(D::Minus2, 0, 1)?;
                     }
-                    xs = conv.forward(&xs)?;
+                    xs = conv.forward_checked(&xs, checkpoint)?;
                     saved.push(xs.clone());
                 }
                 Ok((xs, saved))
@@ -167,6 +181,7 @@ impl PlainUp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn forward(
         &self,
         input: &Tensor,
@@ -174,15 +189,36 @@ impl PlainUp {
         temb: Option<&Tensor>,
         size: Option<(usize, usize)>,
     ) -> Result<Tensor> {
+        self.forward_checked(input, saved, temb, size, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        saved: &[Tensor],
+        temb: Option<&Tensor>,
+        size: Option<(usize, usize)>,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        checkpoint()?;
         match self {
-            Self::Candle(block) => block.forward(input, saved, temb, size),
+            Self::Candle(block) => Ok(block.forward(input, saved, temb, size)?),
             Self::Cpu(block) => {
                 if saved.len() != block.resnets.len() {
-                    candle_core::bail!("plain up block received an invalid number of residuals")
+                    return Err(candle_core::Error::Msg(
+                        "plain up block received an invalid number of residuals".into(),
+                    )
+                    .into());
                 }
                 let mut xs = input.clone();
                 for (resnet, skip) in block.resnets.iter().zip(saved.iter().rev()) {
-                    xs = resnet.forward(&Tensor::cat(&[&xs, skip], 1)?.contiguous()?, temb)?;
+                    checkpoint()?;
+                    xs = resnet.forward_checked(
+                        &Tensor::cat(&[&xs, skip], 1)?.contiguous()?,
+                        temb,
+                        checkpoint,
+                    )?;
                 }
                 if let Some(conv) = &block.upsample {
                     let (height, width) = match size {
@@ -199,7 +235,8 @@ impl PlainUp {
                             )
                         }
                     };
-                    xs = conv.forward(&xs.upsample_nearest2d(height, width)?)?;
+                    xs =
+                        conv.forward_checked(&xs.upsample_nearest2d(height, width)?, checkpoint)?;
                 }
                 Ok(xs)
             }

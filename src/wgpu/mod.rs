@@ -30,7 +30,7 @@ pub(crate) const MAX_PIXELS: usize = 512 * 512;
 const MAX_WEIGHT_ELEMENTS: usize = 64 * 1024 * 1024;
 static DEVICE: Mutex<Option<Arc<DeviceGeneration>>> = Mutex::new(None);
 
-struct DeviceGeneration {
+pub(crate) struct DeviceGeneration {
     device: Device,
     raw: wgpu::Device,
     description: String,
@@ -132,7 +132,7 @@ fn create_generation() -> Result<Arc<DeviceGeneration>> {
     }))
 }
 
-fn acquire_generation(ordinal: usize) -> Result<Arc<DeviceGeneration>> {
+pub(crate) fn acquire_generation(ordinal: usize) -> Result<Arc<DeviceGeneration>> {
     if ordinal != 0 {
         return Err(Error::Unavailable(format!(
             "WGPU supports only the default GPU at ordinal 0; ordinal {ordinal} is unsupported"
@@ -146,18 +146,26 @@ fn acquire_generation(ordinal: usize) -> Result<Arc<DeviceGeneration>> {
         if health.is_ok() {
             return Ok(Arc::clone(existing));
         }
-        existing.mark_lost();
-        // A failed generation must release GPU resources even while old graphs live.
-        let _ = guarded("retiring device", || {
-            existing.raw.destroy();
-            Ok(())
-        });
+        retire_generation(existing);
         *cached = None;
     }
     // Catch dependency unwinds before releasing the cache mutex, avoiding poisoning it.
     let generation = guarded("device initialization", create_generation)?;
+    if let Err(error) = check_health(&generation) {
+        retire_generation(&generation);
+        return Err(error);
+    }
     *cached = Some(Arc::clone(&generation));
     Ok(generation)
+}
+
+fn retire_generation(generation: &DeviceGeneration) {
+    generation.mark_lost();
+    // A failed generation must release GPU resources even while old graphs live.
+    let _ = guarded("retiring device", || {
+        generation.raw.destroy();
+        Ok(())
+    });
 }
 
 #[cfg(test)]
@@ -393,6 +401,16 @@ impl WgpuModel {
         ordinal: usize,
     ) -> Result<Self> {
         let generation = acquire_generation(ordinal)?;
+        Self::new_with_generation(unet, vae, sequence, pooled, generation)
+    }
+
+    pub(crate) fn new_with_generation(
+        unet: HashMap<String, Tensor>,
+        vae: HashMap<String, Tensor>,
+        sequence: &Tensor,
+        pooled: &Tensor,
+        generation: Arc<DeviceGeneration>,
+    ) -> Result<Self> {
         guarded_model(&generation, "model initialization", || {
             let sequence = upload(sequence, "sequence", [1, 77, 2048], &generation.device)?;
             let pooled = upload(pooled, "pooled", [1, 1280], &generation.device)?;

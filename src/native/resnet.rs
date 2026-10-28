@@ -25,10 +25,16 @@ impl Resnet {
         }
     }
 
-    pub(super) fn forward(&self, input: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        temb: Option<&Tensor>,
+        checkpoint: crate::pipeline::Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        checkpoint()?;
         match self {
-            Self::Cpu(block) => block.forward(input, temb),
-            Self::Candle(block) => block.forward(input, temb),
+            Self::Cpu(block) => block.forward_checked(input, temb, checkpoint),
+            Self::Candle(block) => Ok(block.forward(input, temb)?),
         }
     }
 }
@@ -83,14 +89,20 @@ impl CpuResnet {
         })
     }
 
-    fn forward(&self, input: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
+    fn forward_checked(
+        &self,
+        input: &Tensor,
+        temb: Option<&Tensor>,
+        checkpoint: crate::pipeline::Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
         let shortcut = match &self.shortcut {
-            Some(conv) => conv.forward(input)?,
+            Some(conv) => conv.forward_checked(input, checkpoint)?,
             None => input.clone(),
         };
         let hidden = self
             .conv1
-            .forward(&nn::ops::silu(&self.norm1.forward(input)?)?)?;
+            .forward_checked(&nn::ops::silu(&self.norm1.forward(input)?)?, checkpoint)?;
+        checkpoint()?;
         let hidden = match (temb, &self.time_emb_proj) {
             (Some(temb), Some(projection)) => projection
                 .forward(&nn::ops::silu(temb)?)?
@@ -101,7 +113,7 @@ impl CpuResnet {
         };
         let hidden = self
             .conv2
-            .forward(&nn::ops::silu(&self.norm2.forward(&hidden)?)?)?;
-        (shortcut + hidden)? / self.output_scale_factor
+            .forward_checked(&nn::ops::silu(&self.norm2.forward(&hidden)?)?, checkpoint)?;
+        Ok(((shortcut + hidden)? / self.output_scale_factor)?)
     }
 }

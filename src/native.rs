@@ -2,7 +2,14 @@
 //! Candle's stable-diffusion UNet and VAE (candle-transformers 0.9.1, MIT/Apache-2.0):
 //! <https://github.com/huggingface/candle/tree/0.9.1/candle-transformers/src/models/stable_diffusion>
 //! SDXL's additional text/time embedding is applied before every UNet block.
+//!
+//! Native attention slices query rows to bound each F32 score/probability
+//! tensor to 256 MiB. This excludes weights, other activations, and allocator
+//! caches. Cancellation checkpoints run between transformer operations,
+//! attention slices, and convolution bands. Individual device kernels and
+//! opaque Candle blocks still complete before cancellation can be observed.
 
+mod attention;
 mod columns;
 mod conv;
 mod cross_blocks;
@@ -320,19 +327,19 @@ impl Unet {
             .add_embedding
             .forward(&Tensor::cat(&[&pooled, &ids], 1)?)?;
         let emb = (&emb + &added)?;
-        let mut xs = self.conv_in.forward(input)?;
+        let mut xs = self.conv_in.forward_checked(input, checkpoint)?;
         let mut residuals = vec![xs.clone()];
         for block in &self.down {
             checkpoint()?;
             let (next, saved) = match block {
-                Down::Plain(b) => b.forward(&xs, Some(&emb))?,
-                Down::Cross(b) => b.forward(&xs, Some(&emb))?,
+                Down::Plain(b) => b.forward_checked(&xs, Some(&emb), checkpoint)?,
+                Down::Cross(b) => b.forward_checked(&xs, Some(&emb), checkpoint)?,
             };
             xs = next;
             residuals.extend(saved);
         }
         checkpoint()?;
-        xs = self.mid.forward(&xs, Some(&emb))?;
+        xs = self.mid.forward_checked(&xs, Some(&emb), checkpoint)?;
         for (index, block) in self.up.iter().enumerate() {
             checkpoint()?;
             let count = match block {
@@ -355,8 +362,12 @@ impl Unet {
                 None
             };
             xs = match block {
-                Up::Plain(b) => b.forward(&xs, &saved, Some(&emb), upsample_size)?,
-                Up::Cross(b) => b.forward(&xs, &saved, Some(&emb), upsample_size)?,
+                Up::Plain(b) => {
+                    b.forward_checked(&xs, &saved, Some(&emb), upsample_size, checkpoint)?
+                }
+                Up::Cross(b) => {
+                    b.forward_checked(&xs, &saved, Some(&emb), upsample_size, checkpoint)?
+                }
             };
         }
         if !residuals.is_empty() {
@@ -364,9 +375,8 @@ impl Unet {
                 "UNet residual topology left unused tensors".into(),
             ));
         }
-        Ok(self
-            .conv_out
-            .forward(&nn::ops::silu(&self.norm_out.forward(&xs)?)?)?)
+        self.conv_out
+            .forward_checked(&nn::ops::silu(&self.norm_out.forward(&xs)?)?, checkpoint)
     }
 }
 

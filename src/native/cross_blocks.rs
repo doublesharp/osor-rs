@@ -1,6 +1,7 @@
 //! SDXL cross-attention block orchestration.
+use crate::pipeline::Checkpoint;
 use candle_core::{Result, Tensor};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 use candle_transformers::models::stable_diffusion::resnet::ResnetBlock2DConfig;
 
 use super::{resnet::Resnet, spatial::SpatialTransformer, unet_conv::UnetConv2d};
@@ -69,16 +70,23 @@ impl CrossDown {
         Ok(Self { layers, downsample })
     }
 
-    pub fn forward(&self, input: &Tensor, temb: Option<&Tensor>) -> Result<(Tensor, Vec<Tensor>)> {
+    pub fn forward_checked(
+        &self,
+        input: &Tensor,
+        temb: Option<&Tensor>,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<(Tensor, Vec<Tensor>)> {
         let mut xs = input.clone();
         let mut saved =
             Vec::with_capacity(self.layers.len() + usize::from(self.downsample.is_some()));
         for (resnet, attention) in &self.layers {
-            xs = attention.forward(&resnet.forward(&xs, temb)?)?;
+            checkpoint()?;
+            xs = attention
+                .forward_checked(&resnet.forward_checked(&xs, temb, checkpoint)?, checkpoint)?;
             saved.push(xs.clone());
         }
         if let Some(conv) = &self.downsample {
-            xs = conv.forward(&xs)?;
+            xs = conv.forward_checked(&xs, checkpoint)?;
             saved.push(xs.clone());
         }
         Ok((xs, saved))
@@ -137,6 +145,7 @@ impl CrossUp {
         self.layers.len()
     }
 
+    #[cfg(test)]
     pub fn forward(
         &self,
         input: &Tensor,
@@ -144,13 +153,30 @@ impl CrossUp {
         temb: Option<&Tensor>,
         size: Option<(usize, usize)>,
     ) -> Result<Tensor> {
+        self.forward_checked(input, saved, temb, size, &|| Ok(()))
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))
+    }
+
+    pub fn forward_checked(
+        &self,
+        input: &Tensor,
+        saved: &[Tensor],
+        temb: Option<&Tensor>,
+        size: Option<(usize, usize)>,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
         if saved.len() != self.layers.len() {
-            candle_core::bail!("cross-attention up block received an invalid number of residuals")
+            return Err(candle_core::Error::Msg(
+                "cross-attention up block received an invalid number of residuals".into(),
+            )
+            .into());
         }
         let mut xs = input.clone();
         for ((resnet, attention), skip) in self.layers.iter().zip(saved.iter().rev()) {
             xs = Tensor::cat(&[&xs, skip], 1)?.contiguous()?;
-            xs = attention.forward(&resnet.forward(&xs, temb)?)?;
+            checkpoint()?;
+            xs = attention
+                .forward_checked(&resnet.forward_checked(&xs, temb, checkpoint)?, checkpoint)?;
         }
         if let Some(conv) = &self.upsample {
             let (height, width) = match size {
@@ -166,7 +192,7 @@ impl CrossUp {
                     (height, width)
                 }
             };
-            xs = conv.forward(&xs.upsample_nearest2d(height, width)?)?;
+            xs = conv.forward_checked(&xs.upsample_nearest2d(height, width)?, checkpoint)?;
         }
         Ok(xs)
     }
@@ -187,10 +213,15 @@ impl CrossMid {
             final_resnet: resnet(vs.pp("resnets.1"), cfg.channels, cfg.channels, cfg.time_dim)?,
         }))
     }
-    pub fn forward(&self, xs: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
-        let xs = self.0.initial.forward(xs, temb)?;
-        let xs = self.0.attention.forward(&xs)?;
-        self.0.final_resnet.forward(&xs, temb)
+    pub fn forward_checked(
+        &self,
+        xs: &Tensor,
+        temb: Option<&Tensor>,
+        checkpoint: Checkpoint<'_>,
+    ) -> crate::Result<Tensor> {
+        let xs = self.0.initial.forward_checked(xs, temb, checkpoint)?;
+        let xs = self.0.attention.forward_checked(&xs, checkpoint)?;
+        self.0.final_resnet.forward_checked(&xs, temb, checkpoint)
     }
 }
 

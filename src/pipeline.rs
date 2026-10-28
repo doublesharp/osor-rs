@@ -133,7 +133,9 @@ impl Default for PipelineConfig {
     }
 }
 
-/// One inference job. All tensors must be on the model device.
+/// One inference job. All tensors must be on the model device and satisfy
+/// Candle's storage/layout invariants. Callers using `Tensor::from_storage`
+/// must ensure its shape is compatible with the logical storage extent.
 pub struct InferenceInput<'a> {
     /// RGB `[B, 3, H, W]` F32 in `[0, 1]`.
     pub image: &'a Tensor,
@@ -289,6 +291,99 @@ fn validate_tensor(
     device: &candle_core::Device,
     range: Option<(f32, f32)>,
 ) -> Result<()> {
+    validate_tensor_with_readback(
+        t,
+        name,
+        shape,
+        dtype,
+        device,
+        range,
+        ValidationReadback {
+            reduce_on_device: !device.is_cpu(),
+            read: |values: &Tensor| Ok(values.flatten_all()?.to_vec1::<f32>()?),
+        },
+    )
+}
+
+struct ValidationReadback<F> {
+    reduce_on_device: bool,
+    read: F,
+}
+
+fn validate_backing_storage(tensor: &Tensor) -> Result<()> {
+    let invalid = || Error::InvalidInput("tensor layout exceeds its backing storage".into());
+    let (storage, layout) = tensor.storage_and_layout();
+    let elements = match &*storage {
+        candle_core::Storage::Cpu(storage) => match storage {
+            candle_core::CpuStorage::F32(values) => values.len(),
+            candle_core::CpuStorage::F64(values) => values.len(),
+            candle_core::CpuStorage::F16(values) => values.len(),
+            candle_core::CpuStorage::BF16(values) => values.len(),
+            _ => return Err(invalid()),
+        },
+        candle_core::Storage::Cuda(storage) => {
+            #[cfg(feature = "cuda")]
+            {
+                use candle_core::cuda_backend::CudaStorageSlice;
+                match &storage.slice {
+                    CudaStorageSlice::F32(values) => values.len(),
+                    CudaStorageSlice::F64(values) => values.len(),
+                    CudaStorageSlice::F16(values) => values.len(),
+                    CudaStorageSlice::BF16(values) => values.len(),
+                    _ => return Err(invalid()),
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = storage;
+                return Err(invalid());
+            }
+        }
+        candle_core::Storage::Metal(storage) => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                // Candle exposes Metal's physical capacity, not its private
+                // logical element count. Its from_storage precondition still
+                // applies when a pooled buffer has unused padding.
+                storage.buffer().length() / tensor.dtype().size_in_bytes()
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                let _ = storage;
+                return Err(invalid());
+            }
+        }
+    };
+    if layout.dims().len() != layout.stride().len() {
+        return Err(invalid());
+    }
+    let end = if layout.dims().contains(&0) {
+        Some(layout.start_offset())
+    } else {
+        layout
+            .dims()
+            .iter()
+            .zip(layout.stride())
+            .try_fold(layout.start_offset(), |offset, (&dim, &stride)| {
+                offset.checked_add((dim - 1).checked_mul(stride)?)
+            })
+            .and_then(|last| last.checked_add(1))
+    };
+    if end.is_none_or(|end| end > elements) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_tensor_with_readback(
+    t: &Tensor,
+    name: &str,
+    shape: &[usize],
+    dtype: DType,
+    device: &candle_core::Device,
+    range: Option<(f32, f32)>,
+    mut readback: ValidationReadback<impl FnMut(&Tensor) -> Result<Vec<f32>>>,
+) -> Result<()> {
     if t.dims() != shape || t.dtype() != dtype || !t.device().same_device(device) {
         return Err(Error::InvalidInput(format!(
             "{name} must have shape {shape:?} and match dtype and device"
@@ -299,17 +394,192 @@ fn validate_tensor(
             "{name} must have a floating dtype"
         )));
     }
+    validate_backing_storage(t)?;
+    // Preserve the original F64-through-F32 and half-to-F32 validation rules.
     // Tensor sizes are bounded by the caller before this conversion.
-    let values = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    if values
-        .iter()
-        .any(|v| !v.is_finite() || range.is_some_and(|(lo, hi)| *v < lo || *v > hi))
-    {
+    let values = t.to_dtype(DType::F32)?;
+    let invalid = if readback.reduce_on_device && values.elem_count() != 0 {
+        // Intersect finite F32 bounds with the optional range. Comparisons
+        // against NaN range endpoints in the original scalar check are false.
+        let (lo, hi) = range.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        let lo = if lo > -f32::MAX { lo } else { -f32::MAX };
+        let hi = if hi < f32::MAX { hi } else { f32::MAX };
+        let valid = validation_flags(&values, lo, hi)?;
+        // Min is over integer flags, so NaNs cannot be hidden by reduction
+        // order. The cast and readback operate on a newly allocated scalar.
+        let scalar = valid.min_all()?.to_dtype(DType::F32)?;
+        (readback.read)(&scalar)?.as_slice() != [1.0]
+    } else if readback.reduce_on_device {
+        false
+    } else {
+        (readback.read)(&values)?
+            .iter()
+            .any(|v| !v.is_finite() || range.is_some_and(|(lo, hi)| *v < lo || *v > hi))
+    };
+    if invalid {
         return Err(Error::InvalidInput(format!(
             "{name} contains non-finite or out-of-range values"
         )));
     }
     Ok(())
+}
+
+fn validation_flags(values: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if values.device().is_metal() {
+        return Ok(values
+            .contiguous()?
+            .apply_op1_no_bwd(&metal_validation::Flags {
+                lo: lo.to_bits(),
+                hi: hi.to_bits(),
+            })?);
+    }
+    // Candle's CUDA kernels use ordered comparisons without fast-math. The
+    // CPU also exercises this path in tests through the private dispatch seam.
+    Ok(values.ge(lo)?.mul(&values.le(hi)?)?)
+}
+
+// Candle compiles its Metal comparison kernels with fast math by default.
+// Classify F32 bit patterns and compare monotonic integer keys instead, so
+// NaNs, infinities, signed zero and subnormals do not depend on that mode.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal_validation {
+    use std::sync::{Arc, Mutex};
+
+    use candle_core::{
+        CpuStorage, CustomOp1, DType, Layout, MetalStorage, Result, Shape, backend::BackendStorage,
+    };
+    use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline, Device};
+    use objc2_metal::MTLSize;
+
+    const SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct Params { uint count, lo, hi; };
+inline uint order_key(uint bits) {
+    if ((bits & 0x7fffffffu) == 0u) bits = 0u;
+    return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
+}
+kernel void osor_validation_flags(
+    device const uint* input [[buffer(0)]],
+    device uchar* output [[buffer(1)]],
+    constant Params& p [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= p.count) return;
+    uint bits = input[index];
+    uint key = order_key(bits);
+    bool finite = (bits & 0x7fffffffu) < 0x7f800000u;
+    output[index] = uchar(finite && key >= order_key(p.lo) && key <= order_key(p.hi));
+}
+"#;
+
+    #[repr(C)]
+    struct Params {
+        count: u32,
+        lo: u32,
+        hi: u32,
+    }
+
+    pub(super) struct Flags {
+        pub(super) lo: u32,
+        pub(super) hi: u32,
+    }
+
+    static PIPELINES: Mutex<Vec<(u64, Arc<ComputePipeline>)>> = Mutex::new(Vec::new());
+
+    fn kernel_error(error: impl std::fmt::Display) -> candle_core::Error {
+        candle_core::Error::Msg(format!("validation kernel: {error}"))
+    }
+
+    fn pipeline(device: &Device) -> Result<Arc<ComputePipeline>> {
+        let mut cached = PIPELINES
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("validation pipeline cache poisoned".into()))?;
+        let id = device.registry_id();
+        if let Some((_, pipeline)) = cached.iter().find(|(key, _)| *key == id) {
+            return Ok(Arc::clone(pipeline));
+        }
+        let library = device
+            .new_library_with_source(SOURCE, None)
+            .map_err(kernel_error)?;
+        let function = library
+            .get_function("osor_validation_flags", None)
+            .map_err(kernel_error)?;
+        let pipeline = Arc::new(
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(kernel_error)?,
+        );
+        cached.push((id, Arc::clone(&pipeline)));
+        Ok(pipeline)
+    }
+
+    impl CustomOp1 for Flags {
+        fn name(&self) -> &'static str {
+            "osor-validation-flags"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("validation flags kernel requires Metal")
+        }
+
+        fn metal_fwd(
+            &self,
+            storage: &MetalStorage,
+            layout: &Layout,
+        ) -> Result<(MetalStorage, Shape)> {
+            if storage.dtype() != DType::F32 || !layout.is_contiguous() {
+                candle_core::bail!("Metal validation requires contiguous F32 input")
+            }
+            let count = layout.shape().elem_count();
+            let count_u32 = u32::try_from(count).map_err(|_| {
+                candle_core::Error::Msg("validation tensor exceeds Metal index range".into())
+            })?;
+            let offset = layout
+                .start_offset()
+                .checked_mul(DType::F32.size_in_bytes())
+                .ok_or_else(|| candle_core::Error::Msg("validation offset overflow".into()))?;
+            let end = count
+                .checked_mul(DType::F32.size_in_bytes())
+                .and_then(|bytes| offset.checked_add(bytes))
+                .ok_or_else(|| candle_core::Error::Msg("validation extent overflow".into()))?;
+            if end > storage.buffer().length() {
+                candle_core::bail!("validation layout exceeds its Metal buffer")
+            }
+            let device = storage.device();
+            let output = device.new_buffer(count, DType::U8, "osor-validation-flags")?;
+            let params = Params {
+                count: count_u32,
+                lo: self.lo,
+                hi: self.hi,
+            };
+            let pipeline = pipeline(device.metal_device())?;
+            let guard = device.command_encoder()?;
+            let encoder: &ComputeCommandEncoder = guard.as_ref();
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_input_buffer(0, Some(storage.buffer()), offset);
+            encoder.set_output_buffer(1, Some(output.as_ref()), 0);
+            encoder.set_bytes(2, &params);
+            let group = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
+            encoder.dispatch_threads(
+                MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: group.min(count),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            drop(guard);
+            Ok((
+                MetalStorage::new(output, device.clone(), count, DType::U8),
+                layout.shape().clone(),
+            ))
+        }
+    }
 }
 
 impl<B: ModelBackend> Pipeline<B> {
@@ -636,6 +906,47 @@ mod tests {
     use candle_core::Device;
     use std::cell::{Cell, RefCell};
 
+    #[test]
+    fn validation_rejects_a_declared_shape_larger_than_storage() -> Result<()> {
+        for storage in [
+            candle_core::CpuStorage::F32(vec![0.5]),
+            candle_core::CpuStorage::F64(vec![0.5]),
+        ] {
+            let malformed = Tensor::from_storage(
+                candle_core::Storage::Cpu(storage),
+                (2,),
+                candle_core::op::BackpropOp::none(),
+                false,
+            );
+            for reduce_on_device in [false, true] {
+                let read = Cell::new(false);
+                let result = validate_tensor_with_readback(
+                    &malformed,
+                    "test tensor",
+                    &[2],
+                    malformed.dtype(),
+                    malformed.device(),
+                    None,
+                    ValidationReadback {
+                        reduce_on_device,
+                        read: |_values: &Tensor| {
+                            read.set(true);
+                            Ok(vec![0.5, 0.5])
+                        },
+                    },
+                );
+                assert!(
+                    matches!(result, Err(Error::InvalidInput(message)) if message.contains("backing storage"))
+                );
+                assert!(
+                    !read.get(),
+                    "malformed storage must be rejected before readback"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[derive(Default)]
     struct Synthetic {
         decoded: RefCell<Option<Tensor>>,
@@ -702,6 +1013,329 @@ mod tests {
     }
     fn close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+
+    fn scalar_oracle(values: &[f32], range: Option<(f32, f32)>) -> bool {
+        values.iter().all(|value| {
+            value.is_finite()
+                && range.is_none_or(|(lo, _)| *value >= lo || lo.is_nan())
+                && range.is_none_or(|(_, hi)| *value <= hi || hi.is_nan())
+        })
+    }
+
+    fn assert_validation_matches_oracle(
+        t: &Tensor,
+        values: &[f32],
+        range: Option<(f32, f32)>,
+        label: &str,
+    ) -> Result<()> {
+        let expected = scalar_oracle(values, range);
+        for reduced in [None, Some(false), Some(true)] {
+            let result = if let Some(reduced) = reduced {
+                validate_tensor_with_readback(
+                    t,
+                    "test tensor",
+                    t.dims(),
+                    t.dtype(),
+                    t.device(),
+                    range,
+                    ValidationReadback {
+                        reduce_on_device: reduced,
+                        read: |values: &Tensor| Ok(values.flatten_all()?.to_vec1::<f32>()?),
+                    },
+                )
+            } else {
+                validate_tensor(t, "test tensor", t.dims(), t.dtype(), t.device(), range)
+            };
+            match result {
+                Ok(()) => assert!(
+                    expected,
+                    "{label}, reduced={reduced:?}: accepted invalid values"
+                ),
+                Err(Error::InvalidInput(_)) => {
+                    assert!(
+                        !expected,
+                        "{label}, reduced={reduced:?}: rejected valid values"
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    // Every value used here is exactly representable by both F16 and BF16.
+    // The expected verdict is computed from these independent scalar values.
+    fn exercise_validation_cases(device: &Device, dtype: DType) -> Result<()> {
+        let min_half_subnormal = 2f32.powi(-24);
+        let cases = [
+            (
+                "endpoints and signed zero",
+                vec![0., -0., 0.5, 1.],
+                Some((0., 1.)),
+            ),
+            ("below range", vec![-0.125, 0., 1.], Some((0., 1.))),
+            ("above range", vec![0., 1., 1. + 1. / 128.], Some((0., 1.))),
+            (
+                "subnormals",
+                vec![-min_half_subnormal, min_half_subnormal],
+                None,
+            ),
+            (
+                "negative subnormal below zero",
+                vec![-min_half_subnormal, -0.],
+                Some((0., 1.)),
+            ),
+            ("signed zero endpoints", vec![-0., 0.], Some((-0., 0.))),
+            ("positive infinity", vec![0., f32::INFINITY, 1.], None),
+            ("negative infinity", vec![f32::NEG_INFINITY, 0., 1.], None),
+            (
+                "both infinities",
+                vec![f32::INFINITY, f32::NEG_INFINITY],
+                Some((0., 1.)),
+            ),
+            ("nan lower bound", vec![-0.125, 0.5], Some((f32::NAN, 1.))),
+            ("nan upper bound", vec![0.5, 2.], Some((0., f32::NAN))),
+            (
+                "infinite bounds",
+                vec![-1., 1.],
+                Some((f32::NEG_INFINITY, f32::INFINITY)),
+            ),
+            (
+                "positive infinite lower bound",
+                vec![0.5],
+                Some((f32::INFINITY, f32::INFINITY)),
+            ),
+            (
+                "negative infinite upper bound",
+                vec![0.5],
+                Some((f32::NEG_INFINITY, f32::NEG_INFINITY)),
+            ),
+            ("inverted bounds", vec![0.5], Some((1., 0.))),
+        ];
+        for (label, values, range) in cases {
+            let t = Tensor::from_vec(values.clone(), values.len(), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(device)?;
+            assert_validation_matches_oracle(&t, &values, range, label)?;
+        }
+
+        if dtype == DType::F32 {
+            for (values, range) in [
+                (vec![-f32::from_bits(1), 0.], Some((0., 1.))),
+                (vec![f32::from_bits(1), 0.], Some((0., 0.))),
+                (vec![1.0f32.next_down(), 1.], Some((0., 1.))),
+                (vec![1.0f32.next_up(), 1.], Some((0., 1.))),
+                (vec![f32::from_bits(0xffc0_0001), 0.5], None),
+                (vec![f32::from_bits(0x7f80_0001), 0.5], None),
+            ] {
+                let t = Tensor::from_vec(values.clone(), values.len(), &Device::Cpu)?
+                    .to_device(device)?;
+                assert_validation_matches_oracle(&t, &values, range, "f32 bits")?;
+            }
+        }
+
+        // Cover several reduction groups and both ends; invalid padding must
+        // not be lost to the ordering of a floating-point min/max reduction.
+        for position in [0, 1, 63, 127, 128, 255, 256, 1023, 4096] {
+            let mut values = vec![0.5f32; 4097];
+            if let Some(value) = values.get_mut(position) {
+                *value = f32::NAN;
+            }
+            let t = Tensor::from_vec(values.clone(), values.len(), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(device)?;
+            assert_validation_matches_oracle(&t, &values, None, "nan position")?;
+            assert_validation_matches_oracle(&t, &values, Some((0., 1.)), "ranged nan position")?;
+        }
+
+        // The first row is outside the view and must not affect validation.
+        let base = Tensor::new(
+            &[
+                [f32::NAN, f32::INFINITY, -1., 2.],
+                [0., 0.5, 1., 0.],
+                [1., 0., 0.5, 1.],
+            ],
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?;
+        let view = base.narrow(0, 1, 2)?.transpose(0, 1)?.narrow(0, 1, 2)?;
+        assert!(!view.is_contiguous());
+        assert_validation_matches_oracle(&view, &[0.5, 0., 1., 0.5], Some((0., 1.)), "view")?;
+        let bad_view = base.transpose(0, 1)?.narrow(0, 0, 2)?;
+        assert_validation_matches_oracle(
+            &bad_view,
+            &[f32::NAN, 0., 1., f32::INFINITY, 0.5, 0.],
+            None,
+            "invalid view",
+        )?;
+        let repeated = base
+            .narrow(0, 1, 1)?
+            .narrow(1, 1, 1)?
+            .broadcast_as((3, 5))?;
+        assert_validation_matches_oracle(&repeated, &[0.5; 15], Some((0., 1.)), "broadcast")?;
+        Ok(())
+    }
+
+    #[test]
+    fn validation_matches_scalar_oracle_for_float_dtypes_and_views() -> Result<()> {
+        for dtype in [DType::F32, DType::F16, DType::BF16, DType::F64] {
+            exercise_validation_cases(&Device::Cpu, dtype)?;
+        }
+        exercise_f64_conversion(&Device::Cpu)?;
+
+        for (dtype, source, converted) in [
+            (DType::F16, 65_504f32, 65_504f32),
+            (DType::F16, 65_536f32, f32::INFINITY),
+            (
+                DType::BF16,
+                f32::from_bits(0x7f7f_0000),
+                f32::from_bits(0x7f7f_0000),
+            ),
+            (DType::BF16, f32::MAX, f32::INFINITY),
+            (DType::F32, f32::MAX, f32::MAX),
+        ] {
+            let t = Tensor::new(&[source], &Device::Cpu)?.to_dtype(dtype)?;
+            assert_validation_matches_oracle(&t, &[converted], None, "dtype overflow")?;
+        }
+        Ok(())
+    }
+
+    fn exercise_f64_conversion(device: &Device) -> Result<()> {
+        // F64 remains judged after conversion to F32, including overflow and
+        // values rounded onto a range endpoint.
+        for values in [
+            vec![0.0, 1.0 + f64::EPSILON],
+            vec![-f64::MIN_POSITIVE, 0.5],
+            vec![f32::MAX as f64, -(f32::MAX as f64)],
+            vec![f64::MAX, 0.5],
+            vec![-f64::MAX, 0.5],
+            vec![f64::NAN, 0.5],
+        ] {
+            let expected: Vec<f32> = values.iter().map(|value| *value as f32).collect();
+            let t = Tensor::from_vec(values, expected.len(), &Device::Cpu)?.to_device(device)?;
+            for range in [None, Some((0., 1.))] {
+                assert_validation_matches_oracle(&t, &expected, range, "f64 conversion")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validation_checks_metadata_and_empty_tensors() -> Result<()> {
+        let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+        for (shape, dtype) in [(&[3, 2][..], DType::F32), (&[2, 3][..], DType::F64)] {
+            assert!(matches!(
+                validate_tensor(&t, "test tensor", shape, dtype, &Device::Cpu, None),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+        let integer = Tensor::zeros((2, 3), DType::U8, &Device::Cpu)?;
+        assert!(matches!(
+            validate_tensor(
+                &integer,
+                "test tensor",
+                &[2, 3],
+                DType::U8,
+                &Device::Cpu,
+                None
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        let empty = Tensor::zeros(0, DType::F32, &Device::Cpu)?;
+        assert_validation_matches_oracle(&empty, &[], Some((0., 1.)), "empty")?;
+        let scalar = Tensor::new(1f32, &Device::Cpu)?;
+        assert_validation_matches_oracle(&scalar, &[1.], Some((0., 1.)), "scalar")?;
+        Ok(())
+    }
+
+    #[test]
+    fn reduced_validation_reads_only_fresh_scalar_storage() -> Result<()> {
+        for count in [4, 64, 4097] {
+            let t = Tensor::full(0.5f32, (count, 2), &Device::Cpu)?.transpose(0, 1)?;
+            let calls = Cell::new(0);
+            validate_tensor_with_readback(
+                &t,
+                "test tensor",
+                t.dims(),
+                t.dtype(),
+                t.device(),
+                Some((0., 1.)),
+                ValidationReadback {
+                    reduce_on_device: true,
+                    read: |value: &Tensor| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(value.rank(), 0, "readback must receive a scalar reduction");
+                        let (storage, _) = value.storage_and_layout();
+                        if let candle_core::Storage::Cpu(cpu) = &*storage {
+                            assert_eq!(
+                                cpu.as_slice::<f32>()?.len(),
+                                1,
+                                "scalar must own scalar storage"
+                            );
+                        }
+                        Ok(value.flatten_all()?.to_vec1::<f32>()?)
+                    },
+                },
+            )?;
+            assert_eq!(calls.get(), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a real Metal device"]
+    fn metal_validation_matches_scalar_oracle() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::F16] {
+            exercise_validation_cases(&device, dtype)?;
+            // Inspect malformed metadata only; never dispatch a kernel or
+            // conversion against the deliberately undersized backing buffer.
+            let base = Tensor::zeros(1, dtype, &device)?;
+            let (storage, _) = base.storage_and_layout();
+            let candle_core::Storage::Metal(storage) = &*storage else {
+                return Err(Error::InvalidInput("expected Metal test storage".into()));
+            };
+            let count = (storage.buffer().length() / dtype.size_in_bytes())
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidInput("test storage overflow".into()))?;
+            let malformed = Tensor::from_storage(
+                candle_core::Storage::Metal(storage.clone()),
+                (count,),
+                candle_core::op::BackpropOp::none(),
+                false,
+            );
+            assert!(matches!(
+                validate_backing_storage(&malformed),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+        let t = Tensor::zeros(2, DType::F32, &device)?;
+        assert!(matches!(
+            validate_tensor(&t, "test tensor", &[2], DType::F32, &Device::Cpu, None),
+            Err(Error::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a Metal device with BF16 support"]
+    fn metal_bf16_validation_matches_scalar_oracle() -> Result<()> {
+        exercise_validation_cases(&Device::new_metal(0)?, DType::BF16)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device with F16 and BF16 support"]
+    fn cuda_validation_matches_scalar_oracle() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16, DType::F64] {
+            exercise_validation_cases(&device, dtype)?;
+        }
+        exercise_f64_conversion(&device)
     }
 
     #[test]

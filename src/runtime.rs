@@ -310,6 +310,99 @@ impl Osor {
         manifest_sha256: Option<&str>,
         artifact_limits: &ArtifactLimits,
     ) -> Result<Self> {
+        #[cfg(feature = "wgpu")]
+        let acquire = crate::wgpu::acquire_generation;
+        #[cfg(not(feature = "wgpu"))]
+        let acquire = |_ordinal| -> Result<()> {
+            Err(Error::Unavailable(
+                "WGPU requires the wgpu Cargo feature".into(),
+            ))
+        };
+        Self::load_internal_with(
+            &options,
+            manifest_sha256,
+            acquire,
+            |device| match manifest_sha256 {
+                Some(hash) => ModelBundle::load_with_limits_and_manifest_sha256(
+                    path,
+                    device,
+                    options.dtype,
+                    artifact_limits,
+                    hash,
+                ),
+                None => ModelBundle::load_with_limits(path, device, options.dtype, artifact_limits),
+            },
+            |bundle, device, generation| {
+                let (model, compute_device, limits) = match options.backend {
+                    Backend::Wgpu { .. } => {
+                        #[cfg(feature = "wgpu")]
+                        {
+                            // WGPU admits less than the shared bound; see `Osor::inference_limits`.
+                            let limits = InferenceLimits {
+                                max_batch: options.limits.max_batch.min(1),
+                                max_pixels: options.limits.max_pixels.min(crate::wgpu::MAX_PIXELS),
+                            };
+                            let generation = generation.ok_or_else(|| {
+                                Error::Unavailable("WGPU device was not selected".into())
+                            })?;
+                            let model = crate::wgpu::WgpuModel::new_with_generation(
+                                bundle.unet,
+                                bundle.vae,
+                                &bundle.sequence,
+                                &bundle.pooled,
+                                generation,
+                            )?;
+                            let description = model.device_description();
+                            (RuntimeModel::Wgpu(Box::new(model)), description, limits)
+                        }
+                        #[cfg(not(feature = "wgpu"))]
+                        {
+                            let _ = generation;
+                            return Err(Error::Unavailable(
+                                "WGPU requires the wgpu Cargo feature".into(),
+                            ));
+                        }
+                    }
+                    _ => (
+                        RuntimeModel::Native(Box::new(NativeModel::new(
+                            bundle.unet,
+                            bundle.vae,
+                            &bundle.sequence,
+                            &bundle.pooled,
+                            options.dtype,
+                            &device,
+                        )?)),
+                        format!("{:?}", options.backend),
+                        options.limits,
+                    ),
+                };
+                let scheduler = Scheduler::new(bundle.manifest.scheduler.clone())?;
+                let config = PipelineConfig {
+                    timestep: bundle.manifest.timestep,
+                    vae_scaling_factor: bundle.manifest.vae_scaling_factor,
+                    limits,
+                };
+                let pipeline =
+                    Pipeline::new(model, scheduler, bundle.sequence, bundle.pooled, config)?;
+                Ok(Self {
+                    pipeline,
+                    manifest: bundle.manifest,
+                    device,
+                    dtype: options.dtype,
+                    backend: options.backend,
+                    compute_device,
+                })
+            },
+        )
+    }
+
+    fn load_internal_with<Generation, Bundle, Model>(
+        options: &LoadOptions,
+        manifest_sha256: Option<&str>,
+        acquire: impl FnOnce(usize) -> Result<Generation>,
+        load_bundle: impl FnOnce(&Device) -> Result<Bundle>,
+        build: impl FnOnce(Bundle, Device, Option<Generation>) -> Result<Model>,
+    ) -> Result<Model> {
         if !matches!(options.dtype, DType::F32 | DType::F16 | DType::BF16) {
             return Err(Error::InvalidInput(
                 "inference dtype must be F32, F16, or BF16".into(),
@@ -325,71 +418,21 @@ impl Osor {
         // Reject before reading or hashing any bundle bytes.
         options.limits.validate()?;
         let device = options.backend.device()?;
-        let bundle = match manifest_sha256 {
-            Some(hash) => ModelBundle::load_with_limits_and_manifest_sha256(
-                path,
-                &device,
-                options.dtype,
-                artifact_limits,
-                hash,
-            )?,
-            None => ModelBundle::load_with_limits(path, &device, options.dtype, artifact_limits)?,
+        // Match the artifact loader's syntax check before initializing a GPU.
+        // The loader still verifies the digest against the actual manifest bytes.
+        if let Some(hash) = manifest_sha256
+            && (hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Error::InvalidArtifact(
+                "SHA-256 must be 64 hexadecimal characters".into(),
+            ));
+        }
+        let generation = match options.backend {
+            Backend::Wgpu { ordinal } => Some(acquire(ordinal)?),
+            _ => None,
         };
-        let (model, compute_device, limits) = match options.backend {
-            Backend::Wgpu { ordinal } => {
-                #[cfg(feature = "wgpu")]
-                {
-                    // WGPU admits less than the shared bound; see `Osor::inference_limits`.
-                    let limits = InferenceLimits {
-                        max_batch: options.limits.max_batch.min(1),
-                        max_pixels: options.limits.max_pixels.min(crate::wgpu::MAX_PIXELS),
-                    };
-                    let model = crate::wgpu::WgpuModel::new(
-                        bundle.unet,
-                        bundle.vae,
-                        &bundle.sequence,
-                        &bundle.pooled,
-                        ordinal,
-                    )?;
-                    let description = model.device_description();
-                    (RuntimeModel::Wgpu(Box::new(model)), description, limits)
-                }
-                #[cfg(not(feature = "wgpu"))]
-                {
-                    let _ = ordinal;
-                    return Err(Error::Unavailable(
-                        "WGPU requires the wgpu Cargo feature".into(),
-                    ));
-                }
-            }
-            _ => (
-                RuntimeModel::Native(Box::new(NativeModel::new(
-                    bundle.unet,
-                    bundle.vae,
-                    &bundle.sequence,
-                    &bundle.pooled,
-                    options.dtype,
-                    &device,
-                )?)),
-                format!("{:?}", options.backend),
-                options.limits,
-            ),
-        };
-        let scheduler = Scheduler::new(bundle.manifest.scheduler.clone())?;
-        let config = PipelineConfig {
-            timestep: bundle.manifest.timestep,
-            vae_scaling_factor: bundle.manifest.vae_scaling_factor,
-            limits,
-        };
-        let pipeline = Pipeline::new(model, scheduler, bundle.sequence, bundle.pooled, config)?;
-        Ok(Self {
-            pipeline,
-            manifest: bundle.manifest,
-            device,
-            dtype: options.dtype,
-            backend: options.backend,
-            compute_device,
-        })
+        let bundle = load_bundle(&device)?;
+        build(bundle, device, generation)
     }
 
     /// Validated manifest of the loaded bundle.
@@ -520,6 +563,215 @@ impl ModelBackend for NativeModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_preflight_rejects_unavailable_before_bundle_load() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let options = LoadOptions {
+            backend: Backend::Wgpu { ordinal: 0 },
+            ..LoadOptions::default()
+        };
+        let result = Osor::load_internal_with(
+            &options,
+            None,
+            |_ordinal| -> Result<()> {
+                events.borrow_mut().push("adapter");
+                Err(Error::Unavailable("injected adapter failure".into()))
+            },
+            |_device| {
+                events.borrow_mut().push("bundle");
+                Ok(())
+            },
+            |(), _device, _generation| {
+                events.borrow_mut().push("graph");
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Unavailable(message)) if message.contains("injected adapter failure"))
+        );
+        assert_eq!(*events.borrow(), ["adapter"]);
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_preflight_reuses_selected_generation_for_graph() -> Result<()> {
+        use std::{cell::RefCell, sync::Arc};
+
+        let events = RefCell::new(Vec::new());
+        let selected = Arc::new(1);
+        let current = RefCell::new(Arc::clone(&selected));
+        let options = LoadOptions {
+            backend: Backend::Wgpu { ordinal: 0 },
+            ..LoadOptions::default()
+        };
+        let same_generation = Osor::load_internal_with(
+            &options,
+            None,
+            |ordinal| {
+                assert_eq!(ordinal, 0);
+                events.borrow_mut().push("adapter");
+                Ok(Arc::clone(&current.borrow()))
+            },
+            |_device| {
+                events.borrow_mut().push("bundle");
+                *current.borrow_mut() = Arc::new(2);
+                Ok(())
+            },
+            |(), _device, generation| {
+                events.borrow_mut().push("graph");
+                Ok(generation.is_some_and(|generation| Arc::ptr_eq(&selected, &generation)))
+            },
+        )?;
+        assert!(same_generation, "graph used a different generation");
+        assert_eq!(*events.borrow(), ["adapter", "bundle", "graph"]);
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_preflight_validates_options_and_pin_before_acquisition() {
+        use std::cell::Cell;
+
+        let wgpu = Backend::Wgpu { ordinal: 0 };
+        let cases = [
+            (
+                LoadOptions {
+                    backend: wgpu,
+                    dtype: DType::U8,
+                    ..LoadOptions::default()
+                },
+                None,
+                "input",
+            ),
+            (
+                LoadOptions {
+                    backend: wgpu,
+                    dtype: DType::BF16,
+                    ..LoadOptions::default()
+                },
+                None,
+                "unavailable",
+            ),
+            (
+                LoadOptions {
+                    backend: wgpu,
+                    limits: InferenceLimits {
+                        max_batch: 0,
+                        max_pixels: 1024,
+                    },
+                    ..LoadOptions::default()
+                },
+                None,
+                "input",
+            ),
+            (
+                LoadOptions {
+                    backend: Backend::Wgpu { ordinal: 1 },
+                    ..LoadOptions::default()
+                },
+                None,
+                "unavailable",
+            ),
+            (
+                LoadOptions {
+                    backend: wgpu,
+                    ..LoadOptions::default()
+                },
+                Some("bad"),
+                "pin",
+            ),
+            (
+                LoadOptions {
+                    backend: wgpu,
+                    ..LoadOptions::default()
+                },
+                Some("gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"),
+                "pin",
+            ),
+        ];
+        for (options, pin, expected) in cases {
+            let calls = Cell::new(0);
+            let result = Osor::load_internal_with(
+                &options,
+                pin,
+                |_ordinal| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_device| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |(), _device, _generation| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            let expected_error = match (expected, &result) {
+                ("input", Err(Error::InvalidInput(_)))
+                | ("unavailable", Err(Error::Unavailable(_))) => true,
+                ("pin", Err(Error::InvalidArtifact(message))) => message.contains("64 hexadecimal"),
+                _ => false,
+            };
+            assert!(expected_error, "unexpected validation result: {result:?}");
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_preflight_still_rejects_manifest_digest_mismatch() -> Result<()> {
+        struct ScratchDir(PathBuf);
+        impl Drop for ScratchDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = match std::env::var_os("OSOR_SCRATCH_ROOT") {
+            Some(path) => PathBuf::from(path),
+            None if Path::new("/Volumes/Scratch").is_dir() => {
+                PathBuf::from("/Volumes/Scratch/osor-rs")
+            }
+            None => {
+                return Err(Error::InvalidInput(
+                    "Scratch volume is not mounted; set OSOR_SCRATCH_ROOT on other hosts".into(),
+                ));
+            }
+        };
+        let path = root
+            .join("tmp/native-sdxl")
+            .join(format!("wgpu-preflight-pin-{}", std::process::id()));
+        std::fs::create_dir(&path)?;
+        let scratch = ScratchDir(path);
+        std::fs::write(scratch.0.join("manifest.json"), b"{}")?;
+        let options = LoadOptions {
+            backend: Backend::Wgpu { ordinal: 0 },
+            ..LoadOptions::default()
+        };
+        let pin = "A".repeat(64);
+        let result = Osor::load_internal_with(
+            &options,
+            Some(&pin),
+            |_ordinal| Ok(()),
+            |device| {
+                ModelBundle::load_with_limits_and_manifest_sha256(
+                    &scratch.0,
+                    device,
+                    DType::F32,
+                    &ArtifactLimits::default(),
+                    &pin,
+                )
+            },
+            |_bundle, _device, _generation| Ok(()),
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidArtifact(message)) if message.contains("manifest SHA256 mismatch"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn cpu_is_default_and_missing_gpu_features_return_unavailable() -> Result<()> {
