@@ -1,6 +1,6 @@
 [package]
 name = "osor-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -12,6 +12,10 @@ default = []
 metal = ["dep:candle-metal-kernels", "dep:objc2-metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["dep:candle-kernels", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 wgpu = ["dep:burn", "dep:pollster"]
+# Opt-in: tunes WGPU matmul/convolution kernels by timing them at run time.
+# Faster warm inference, but each process pays a long first-job tuning cost
+# and may select different kernels than another process (see docs/wgpu.md).
+wgpu-autotune = ["wgpu", "burn/autotune"]
 # macOS only: route Candle CPU matrix products through Apple Accelerate.
 # Changes CPU accumulation order; requalify stage tolerances before relying on it.
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]

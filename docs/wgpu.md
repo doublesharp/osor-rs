@@ -39,6 +39,25 @@ reported as library errors. An application compiled with `panic=abort` cannot
 recover an unwinding dependency failure. The library does not change the
 application's panic policy or install a panic hook.
 
+## Optional autotuning
+
+The `wgpu-autotune` feature enables Burn's kernel autotuning. On the M2 Max it
+passes all 18 stages on both qualification cases and cut warm inference from
+3.31 s to 1.05 s at 80×96 and from 18.25 s to 16.73 s at 640×384, mostly in
+the UNet. It has three costs, so it is off by default:
+
+- Each process tunes kernels on first use of each shape: the first 80×96 and
+  640×384 jobs took about 50 s and 75 s on a loaded host.
+- Peak footprint rose from about 10.4 GiB to 12.4 GiB.
+- Kernels are chosen by timing them, so two processes can select different
+  kernels and produce slightly different outputs from identical noise. Results
+  stayed inside the frozen tolerances in the runs above, but are not bitwise
+  reproducible across processes.
+
+The library enables no autotune persistence, so it writes no tuning cache to
+disk. Burn's `fusion` feature was also measured: it was no faster and failed
+the 80×96 limits, so it is not enabled.
+
 WGPU uses no Python, pickle loader or libtorch runtime. The locked runtime
 dependency graph for `--features wgpu` was inspected with `cargo tree -e normal
 -i torch-sys`; libtorch was not activated. Optional packages appearing in the

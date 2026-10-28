@@ -39,14 +39,16 @@ Linux and Windows CPU cross-checks pass, but native runtime acceptance on those 
 
 ## Install
 
-Use Rust **1.95.0**. The crate is not published to crates.io. Add the private Git repository at the verified source revision, using credentials with access to it:
+Use Rust **1.95.0**. The crate is not published to crates.io. Add the private Git repository at a release tag, using credentials with access to it, and keep the resolved commit in your `Cargo.lock`:
 
 ```toml
 [dependencies.osor-rs]
 git = "https://github.com/doublesharp/osor-rs"
-rev = "0263f15c9ddd0067f7224c686330e0d6e308fca6"
+tag = "v0.2.0"
 # features = ["metal"]  # Enable for macOS Metal.
 ```
+
+See the [changelog](CHANGELOG.md) for breaking changes between releases.
 
 <details>
 <summary>Develop from a local checkout</summary>
@@ -202,6 +204,7 @@ For WGPU, use `--features wgpu` and replace the final `metal` argument with `wgp
 | Metal | `metal` | macOS; M2 Max small-case and independent photo acceptance |
 | CUDA | `cuda` | Requires an NVIDIA device, compatible driver, toolkit, and host compiler; device acceptance pending |
 | WGPU | `wgpu` | F32; resident GPU graph with CPU staging; M2 Max small-case and independent photo acceptance |
+| WGPU + autotune | `wgpu-autotune` | Faster warm WGPU inference after a long first-job tuning pass; not bitwise reproducible across processes |
 
 Native Metal/CUDA APIs also accept F16 and BF16, but reduced precision needs separate numerical qualification. F32 is the current acceptance baseline.
 

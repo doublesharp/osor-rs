@@ -109,3 +109,4 @@ jobs:
         run: |
           ./scripts/cargo.sh clippy --locked --all-targets --features wgpu -- -D warnings
           ./scripts/cargo.sh test --locked --all-targets --features wgpu
+          ./scripts/cargo.sh check --locked --all-targets --features wgpu-autotune

@@ -54,6 +54,7 @@ The library now depends on Candle 0.11.0, safetensors 0.8.0, sha2 0.11.1, Burn 0
 | Metal | 18/18 pass | 18/18 pass | 0.00026733 / 0.000002626 |
 | WGPU | 18/18 pass | 18/18 pass | 0.00029010 / 0.000004027 |
 | CPU + `accelerate` | 18/18 pass | 18/18 pass | 0.00016105 / 0.000002851 |
+| WGPU + `wgpu-autotune` | 18/18 pass | 18/18 pass | 0.00038100 / 0.000004980 |
 
 The full-bundle missing-critical-weight test passes. On the first CPU run, Candle 0.11's tiled CPU convolution failed the 80×96 limits (decoded image maximum 0.0021 against 0.001; alpha logits 1.09e-4 against 1e-4) although its F64-referenced error was ordinary F32 rounding: its reduction order differs from PyTorch's. VAE convolutions on CPU now use the channel-major column path, which restored all 18 stages; the 80×96 CPU decoded maximum is 0.00054526, below the 0.00082076 measured on Candle 0.9.1. Tolerances were not changed. The CPU photo maximum rose from 0.00007838 to 0.00012127 because the UNet's convolutions still use Candle's tiled CPU convolution. Logs are under `/Volumes/Scratch/osor-rs/reports/dependency-upgrade-20261028`.
 
