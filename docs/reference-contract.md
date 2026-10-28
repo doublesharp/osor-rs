@@ -3,6 +3,7 @@
 Reference source: [Zhouqm-Git/osor at d5b68e822996d61aae6ba612e5e9b5a14f576879](https://github.com/Zhouqm-Git/osor/tree/d5b68e822996d61aae6ba612e5e9b5a14f576879). The detailed recipe is in `osor-sdxlinpainting/scripts/inference_enhance.py`, `configs/phase2.yaml` and the generator/prompt modules they import. This is a port specification, not evidence of native inference.
 
 - Normalize encoded RGB input from [0,1] to [-1,1]. Encode with the base VAE and **sample** its latent posterior, then apply the VAE scaling factor.
+- Capture `posterior_moments` as the raw eight-channel encoder output (`latent_dist.parameters` in diffusers). Capture `posterior_logvar` after clamping to [-30,20], and use that clamped tensor for the posterior standard deviation and sample. Reconstructing raw moments from `latent_dist.logvar` loses values outside the clamp range and produces a false stage mismatch.
 - Max-pool the white-is-removal mask with kernel and stride 8; preserve the reference resize/aspect policy separately from the tensor API.
 - Supply explicit diffusion noise and use the base DDPM scheduler at timestep 400. Form the UNet input by concatenating noised original latents (4), pooled mask (1), and original latents (4): nine channels.
 - Restore rank-256 attention, convolution and feed-forward LoRA targets from the Phase II recipe. Restore the trained five-channel output head and validate every required tensor.

@@ -1,0 +1,75 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Format, Clippy, and tests
+        env:
+          OSOR_SCRATCH_ROOT: ${{ runner.temp }}/osor-rs
+        shell: bash
+        run: ./scripts/check.sh
+
+  metal-build:
+    name: Metal feature compile (macOS)
+    runs-on: macos-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Check Metal feature (build only)
+        env:
+          OSOR_SCRATCH_ROOT: ${{ runner.temp }}/osor-rs
+        shell: bash
+        run: ./scripts/cargo.sh check --locked --all-targets --features metal
+
+  wgpu:
+    name: WGPU source checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: WGPU Clippy and ordinary tests (no device qualification)
+        env:
+          OSOR_SCRATCH_ROOT: ${{ runner.temp }}/osor-rs
+        shell: bash
+        run: |
+          ./scripts/cargo.sh clippy --locked --all-targets --features wgpu -- -D warnings
+          ./scripts/cargo.sh test --locked --all-targets --features wgpu
