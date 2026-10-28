@@ -409,6 +409,19 @@ impl Osor {
         self.dtype
     }
 
+    /// Deterministic posterior and diffusion noise for a `[batch, 3, height,
+    /// width]` job, in the model dtype on [`Self::device`]. See
+    /// [`crate::noise`] for the versioned seed contract.
+    pub fn seeded_noise(
+        &self,
+        seed: u64,
+        batch: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<crate::noise::Noise> {
+        crate::noise::seeded_noise(seed, batch, height, width, self.dtype, &self.device)
+    }
+
     /// Effective admission limits. WGPU lowers requested limits to batch one
     /// and its own pixel bound; other backends use the requested limits.
     pub fn inference_limits(&self) -> InferenceLimits {

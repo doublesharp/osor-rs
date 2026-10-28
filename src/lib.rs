@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod conversion;
 pub mod native;
+pub mod noise;
 pub mod parity;
 pub mod pipeline;
 pub mod preprocess;

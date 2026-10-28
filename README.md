@@ -96,7 +96,7 @@ Inputs are NCHW tensors on `model.device()`:
 
 Height and width must be multiples of eight in **32..=1024**. CPU and native GPU admission supports batches up to four, subject to the configured total pixel limit. WGPU supports batch one and at most **262,144 pixels**, including rectangular inputs. Requested `InferenceLimits` outside 1..=4 images and 1..=4,194,304 batch-inclusive pixels are rejected before any bundle I/O; `Osor::inference_limits()` reports the effective limits after WGPU lowers them. These bounds do not guarantee that a job fits available memory.
 
-Supply independent standard-normal noise tensors for ordinary inference. Preserve their actual values for reproducibility: identical seeds across frameworks do not guarantee identical random tensors.
+Supply independent standard-normal noise tensors for ordinary inference. `model.seeded_noise(seed, batch, height, width)` generates both from a `u64` seed with a versioned, platform-independent algorithm (see `osor_rs::noise`), so an application can store a seed instead of the tensors and retry with a different seed. Seeds are not portable to other frameworks: for cross-framework parity, preserve the actual tensor values.
 
 `InferenceResult` contains:
 
