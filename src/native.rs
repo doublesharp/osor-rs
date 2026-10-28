@@ -587,6 +587,66 @@ mod tests {
                 pooled,
             )?)
         }
+
+        fn deterministic_model(&self, sequence: &Tensor, pooled: &Tensor) -> Result<NativeModel> {
+            // Populate every parameter before replacing the random initializer.
+            drop(self.model(sequence, pooled)?);
+            for map in [&self.unet, &self.vae] {
+                let variables = map
+                    .data()
+                    .lock()
+                    .map_err(|_| Error::InvalidArtifact("fixture variable lock poisoned".into()))?;
+                for (name, variable) in variables.iter() {
+                    let tensor = if name.ends_with(".weight") && variable.rank() > 1 {
+                        let fan_in = variable
+                            .dims()
+                            .iter()
+                            .skip(1)
+                            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+                            .ok_or_else(|| {
+                                Error::InvalidArtifact("fixture fan-in overflow".into())
+                            })?;
+                        let denominator = fan_in
+                            .isqrt()
+                            .max(1)
+                            .checked_next_power_of_two()
+                            .ok_or_else(|| {
+                                Error::InvalidArtifact("fixture scale overflow".into())
+                            })?;
+                        let scale = 0.5 / denominator as f32;
+                        let seed = name.bytes().fold(0x811c_9dc5u32, |hash, byte| {
+                            (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+                        });
+                        let values = fixed_values(variable.elem_count(), seed)
+                            .into_iter()
+                            .map(|value| value * scale)
+                            .collect::<Vec<_>>();
+                        Tensor::from_vec(values, variable.shape().clone(), &Device::Cpu)?
+                    } else if name.ends_with(".weight") {
+                        Tensor::ones(variable.shape().clone(), DType::F32, &Device::Cpu)?
+                    } else if name.ends_with(".bias") {
+                        Tensor::zeros(variable.shape().clone(), DType::F32, &Device::Cpu)?
+                    } else {
+                        return Err(Error::InvalidArtifact(format!(
+                            "unexpected fixture parameter {name}"
+                        )));
+                    };
+                    variable.set(&tensor)?;
+                }
+            }
+            // Rebuild so cached cross-attention keys/values use the fixed weights.
+            self.model(sequence, pooled)
+        }
+    }
+
+    fn fixed_values(count: usize, mut state: u32) -> Vec<f32> {
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Odd dyadic values in (-1, 1), with no zero matrix coefficients.
+                ((state >> 24) as i32 * 2 - 255) as f32 / 256.
+            })
+            .collect()
     }
 
     fn conditioning() -> Result<(Tensor, Tensor)> {
@@ -713,15 +773,16 @@ mod tests {
     #[test]
     fn tiny_complete_graph_uses_all_conditioning_and_preserves_shapes() -> Result<()> {
         let tiny = Tiny::new();
-        let (sequence, pooled) = conditioning()?;
-        let m = tiny.model(&sequence, &pooled)?;
         let device = &Device::Cpu;
-        let image = Tensor::randn(0f32, 1f32, (1, 3, 32, 32), device)?;
+        let sequence = Tensor::from_vec(fixed_values(2 * 8, 1), (1, 2, 8), device)?;
+        let pooled = Tensor::from_vec(fixed_values(8, 2), (1, 8), device)?;
+        let m = tiny.deterministic_model(&sequence, &pooled)?;
+        let image = Tensor::from_vec(fixed_values(3 * 32 * 32, 3), (1, 3, 32, 32), device)?;
         let moments = m.encode_moments(&image)?;
         assert_eq!(moments.dims(), &[1, 8, 4, 4]);
-        let latent = Tensor::randn(0f32, 1f32, (1, 4, 4, 4), device)?;
+        let latent = Tensor::from_vec(fixed_values(4 * 4 * 4, 4), (1, 4, 4, 4), device)?;
         assert_eq!(m.decode(&latent)?.dims(), &[1, 3, 32, 32]);
-        let input = Tensor::randn(0f32, 1f32, (1, 9, 4, 4), device)?;
+        let input = Tensor::from_vec(fixed_values(9 * 4 * 4, 5), (1, 9, 4, 4), device)?;
         let ids = Tensor::new(&[[32f32, 32., 0., 0., 32., 32.]], device)?;
         let original = m.denoise(&input, 400, &ids)?;
         assert_eq!(original.dims(), &[1, 5, 4, 4]);
@@ -739,21 +800,44 @@ mod tests {
             &original,
             &other_pooled.denoise(&input, 400, &ids)?
         )?);
-        // Batch entries see the same bound prompt as a batch-one call. Batched
-        // matrix products may round differently, so this is not bitwise.
-        let batch = Tensor::cat(&[&input, &input], 0)?;
-        let batch_ids = Tensor::cat(&[&ids, &ids], 0)?;
-        let batched = m.denoise(&batch, 400, &batch_ids)?;
-        for index in 0..2 {
-            let difference = (&original - batched.narrow(0, index, 1)?)?
-                .abs()?
-                .flatten_all()?
-                .max(0)?
-                .to_scalar::<f32>()?;
-            assert!(
-                difference <= 1e-5,
-                "batch entry {index} differs by {difference}"
-            );
+        // Keep the minimum-size graph checks above. For batch equivalence,
+        // use 2x2 bottleneck cells: this 64-channel fixture otherwise has only
+        // two values per normalization group, unlike the production UNet.
+        // Distinct entries and reversed order expose mixing or duplicated
+        // images while retaining the same F32 bound.
+        let first_input = Tensor::from_vec(fixed_values(9 * 8 * 8, 5), (1, 9, 8, 8), device)?;
+        let second_input = Tensor::from_vec(fixed_values(9 * 8 * 8, 6), (1, 9, 8, 8), device)?;
+        let ids = Tensor::new(&[[64f32, 64., 0., 0., 64., 64.]], device)?;
+        let first = m.denoise(&first_input, 400, &ids)?;
+        let second = m.denoise(&second_input, 400, &ids)?;
+        let contrast = (&first - &second)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(
+            contrast > 1e-3,
+            "fixture must distinguish the two images: {contrast}"
+        );
+        for entries in [
+            [(&first_input, &first), (&second_input, &second)],
+            [(&second_input, &second), (&first_input, &first)],
+        ] {
+            let batch = Tensor::cat(&entries.map(|(input, _)| input), 0)?;
+            let batch_ids = Tensor::cat(&[&ids, &ids], 0)?;
+            let batched = m.denoise(&batch, 400, &batch_ids)?;
+            assert_eq!(batched.dims(), &[2, 5, 8, 8]);
+            for (index, &(_, expected)) in entries.iter().enumerate() {
+                let difference = (expected - batched.narrow(0, index, 1)?)?
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_scalar::<f32>()?;
+                assert!(
+                    difference <= 1e-5,
+                    "batch entry {index} differs by {difference}"
+                );
+            }
         }
         Ok(())
     }

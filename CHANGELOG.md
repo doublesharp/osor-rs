@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stabilize tiny-model batch checks with deterministic parameters and distinct,
+  reordered images, retaining the existing F32 tolerance and conditioning checks.
 - Bound native UNet and VAE attention score tensors to 256 MiB each by
   slicing query rows; weights and other activations have separate costs.
 - Check cancellation between transformer operations, attention slices, and
