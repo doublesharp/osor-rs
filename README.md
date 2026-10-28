@@ -138,7 +138,7 @@ A trusted manifest digest pins an imported bundle. The loader verifies the exact
 - `infer` runs one synchronous job.
 - `infer_with_observer` reports the 18 intermediate stages as typed `Stage` values in order; `Stage::as_str()` gives the pinned capture name. Return `Error::Cancelled` from the observer to cancel between stages; an executing neural layer is synchronous.
 - `infer_profiled` records synchronized stage timings.
-- `preprocess::reference_resize_dimensions` plans the upstream CLI resize dimensions. Image resampling and crop selection remain application responsibilities.
+- `preprocess::reference_resize_dimensions` plans the upstream CLI resize dimensions. Alternatively, `preprocess::pad_to_model_size` pads image and mask to the model's size rules by repeating edge pixels, and `Padding::crop_result` crops the output back. Either policy changes results near edges; image resampling and crop selection remain application responsibilities.
 
 Applications own model installation, memory admission, concurrency, selections, jobs, and undo. See the complete [local inference example](examples/local_inference.rs).
 
