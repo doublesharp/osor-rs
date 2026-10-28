@@ -2,7 +2,71 @@
 
 The complete Phase II model has executed on macOS/aarch64, Apple M2 Max, with CPU, Candle Metal, and Burn WGPU. This qualifies the named FP32 cases below; it does not establish accuracy for every image, reduced precision, or another platform.
 
-## Numerical results
+## Unreleased follow-up
+
+This section records the follow-up committed as `b370d0d` and its loader
+resource-error correction. Subsequent attention-memory, cancellation,
+validation-transfer and WGPU-preflight changes require their own verification.
+
+These inference algorithms pass all 18 stages on both original cases for
+CPU, CPU with Accelerate, Metal and WGPU. The trusted manifest and both frozen
+tolerance files retain the hashes recorded below. The photo decoded maximum /
+RMS errors are 0.000121355 / 0.000002554 on CPU, 0.000161111 / 0.000002843
+with Accelerate, 0.000294715 / 0.000002955 on Metal, and
+0.000290096 / 0.000004027 on WGPU. These results do not establish a general
+accuracy improvement: the CPU photo maximum did not improve.
+
+Broader checks uncovered and repaired distinct-image VAE batch corruption.
+CPU attention now materializes the transposed input before projection; Metal
+VAE attention evaluates each image separately. Deterministic B2/B4 operator
+regressions failed before the repairs and now match separate calls exactly.
+The current CPU real-model posterior for the controlled second B2 entry also
+matches its separate call bit for bit. Remaining errors for the first B2 entry
+also occur when that entry runs alone.
+
+The following additional photo cases **do not pass** the existing frozen
+limits. Counts are passing stages out of 18; the small envelope was selected
+for the 80×96 and 88×104 cases, and the full-photo envelope for 512² and 1024²,
+before reference capture. No limits were widened or swapped after failure.
+
+| Additional case | CPU | Metal | WGPU |
+|---|---:|---:|---:|
+| B2, 80×96 | 6 | 14 | Outside admission |
+| B4, 80×96 | 7 | 15 | Outside admission |
+| B1, 88×104, latent 11×13 | 7 | 16 | 5 |
+| B1, 512×512 | 17 | 16 | 16 |
+| B1, 1024×1024 | 16 | 16 | Outside admission |
+
+At 1024², CPU and Metal exceed the denoising-output and alpha-logit limits;
+the other 16 stages pass. The independent CPU reference completed in the
+isolated environment at about 29.4 GiB sampled peak RSS, with a 45 GiB guard
+and a minimum 40% free-memory guard. The earlier 29 GiB guarded stop remains
+preserved. This is shape coverage, not independent image-quality acceptance:
+these inputs resize and sometimes flip the preserved CORNE-Val photos.
+Broader numerical acceptance remains open, including the residual odd-size
+and alpha errors; admission does not promise agreement with either envelope.
+
+For this snapshot, CPU and Accelerate ordinary suites pass 96 tests each; combined
+Metal/WGPU ordinary tests pass 98. Formatting, strict Clippy, doctests and
+warning-free rustdoc pass. Bitwise convolution/cache fixtures use exact
+dyadic coefficients on both portable CPU and Accelerate, with separate F64
+numerical checks. The 776-case Pillow oracle compares 5,912,751 output bytes
+with zero mismatches. See [preprocessing](preprocessing.md) for its scope.
+The reviewed convolution thread-creation panic path and the analogous bundle
+hashing path now use fallible spawning with injected-failure regressions.
+
+Unsuppressed feature checks, actual Metal operator/batch checks, WGPU operator
+and lifecycle checks, and Linux/Windows CPU cross-builds are recorded under
+`/Volumes/Scratch/osor-rs/reports/codex-integration-20261028`. Broader inputs,
+references, failures and source fingerprints remain under
+`/Volumes/Scratch/osor-rs/reports/codex-finish-20261028`. Model loading verifies
+the original pinned bytes. Later changes to exactness fixtures, operational
+error classification and package license metadata do not change the measured
+inference algorithms. Native
+Linux/Windows full-model execution, CUDA device execution and reduced-precision
+acceptance remain separate gates.
+
+## v0.2.0 numerical results
 
 - The independent 80×96 random input passes all 18 stages against the existing frozen small-case limits on CPU, Metal, and WGPU. The full-bundle missing-critical-weight test passes.
 - A 704×368 CORNE-Val photo exposed a long-reduction precision problem. The measured WGPU normalization fixture improved from maximum error 0.004425 to 0.000005722 without changing its `1e-5` limit. A normal CPU regression also checks long groups against an independent F64 closed-form result.

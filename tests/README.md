@@ -12,6 +12,12 @@ separate from numerical inference acceptance and application filesystem tests.
 
 Normal tests use small synthetic inputs and do not download weights. The ignored tests in [`real_model.rs`](real_model.rs) opt in to local full-model acceptance. They run inference with captured posterior and diffusion noise, collect all 18 pinned stages, and compare each element with the corresponding reference stage using an explicit absolute and relative tolerance. A seed alone is not sufficient for cross-framework parity.
 
+The unreleased follow-up retains passing acceptance for the two original cases.
+Additional B2/B4, odd-size, 512² and native 1024² photo cases have executed but
+exceed the unchanged frozen limits; see [qualification](../docs/qualification.md).
+The isolated CPU 1024² reference is now available after a guarded solo run.
+Keep numerical failure reports even when the test correctly exits nonzero.
+
 Capture `posterior_moments` from the raw VAE output: diffusers exposes it as `latent_dist.parameters`. Its `latent_dist.logvar` is already clamped to [-30,20], so concatenating `mean` and `logvar` does not reconstruct the raw moments. The separate `posterior_logvar` stage and posterior sampling use the clamped values. This distinction matters on actual photos with extreme log variance.
 
 Prepare these local artifacts, keeping tensors, models and reports under Scratch rather than in Git:

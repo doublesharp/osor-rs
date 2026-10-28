@@ -816,8 +816,11 @@ fn tensor_with_parallel_hash(
         let hashing = check_spawn()
             .and_then(|()| std::thread::Builder::new().spawn_scoped(scope, || hasher.update(data)))
             .map_err(|error| {
-                artifact_error(format!(
-                    "unable to create tensor hashing worker; reduce concurrent loads or raise the OS thread limit: {error}"
+                Error::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "unable to create tensor hashing worker; reduce concurrent loads or raise the OS thread limit: {error}"
+                    ),
                 ))
             })?;
         let tensor = tensor_from_bytes(data, source_dtype, shape, device, dtype);
@@ -1361,10 +1364,15 @@ mod tests {
             || Err(std::io::Error::other("injected thread limit")),
         );
         match result {
-            Err(error) => {
+            Err(Error::Io(error)) => {
                 let message = error.to_string();
                 assert!(message.contains("tensor hashing worker"), "{message}");
                 assert!(message.contains("injected thread limit"), "{message}");
+            }
+            Err(error) => {
+                return Err(artifact_error(format!(
+                    "thread creation must report an OS error, got {error}"
+                )));
             }
             Ok(_) => {
                 return Err(artifact_error(
