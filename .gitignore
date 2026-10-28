@@ -4,6 +4,7 @@
 /reports/
 /data/
 /tmp/
+/AGENT_PROMPT*.txt
 *.pth
 *.pt
 *.onnx
