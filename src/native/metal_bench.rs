@@ -60,3 +60,80 @@ fn metal_convolution_breakdown_at_vae_shapes() -> Result<()> {
     let _ = DType::F32;
     Ok(())
 }
+
+#[test]
+#[ignore = "requires a Metal device; prints timings"]
+fn metal_decoder_elementwise_and_norm_costs() -> Result<()> {
+    use candle_nn::{Module, VarBuilder};
+    use std::collections::HashMap;
+    let device = Device::new_metal(0)?;
+    for (channels, height, width) in [(128, 384, 640), (256, 384, 640), (512, 192, 320)] {
+        let xs = Tensor::randn(0f32, 1f32, (1, channels, height, width), &device)?;
+        let other = Tensor::randn(0f32, 1f32, (1, channels, height, width), &device)?;
+        let bias = Tensor::randn(0f32, 1f32, channels, &device)?;
+        let weights = HashMap::from([
+            (
+                "weight".to_owned(),
+                Tensor::ones(channels, DType::F32, &device)?,
+            ),
+            (
+                "bias".to_owned(),
+                Tensor::zeros(channels, DType::F32, &device)?,
+            ),
+        ]);
+        let norm = super::vae_encoder::StableGroupNorm::new(
+            channels,
+            VarBuilder::from_tensors(weights, DType::F32, &device),
+        )?;
+        let group_norm = time(&device, 5, || Ok(norm.forward(&xs)?))?;
+        let silu = time(&device, 5, || Ok(candle_nn::ops::silu(&xs)?))?;
+        let add = time(&device, 5, || Ok((&xs + &other)?))?;
+        let bias_add = time(&device, 5, || {
+            Ok(xs.broadcast_add(&bias.reshape((1, channels, 1, 1))?)?)
+        })?;
+        let half = xs
+            .narrow(2, 0, height / 2)?
+            .narrow(3, 0, width / 2)?
+            .contiguous()?;
+        let upsample = time(&device, 5, || Ok(half.upsample_nearest2d(height, width)?))?;
+        let weight = Tensor::randn(0f32, 0.05f32, (channels, channels, 3, 3), &device)?;
+        let banded = time(&device, 3, || {
+            Ok(super::columns::conv2d(
+                &xs,
+                &weight,
+                1,
+                1,
+                super::conv::MAX_SCRATCH_ELEMENTS,
+            )?)
+        })?;
+        let whole = time(&device, 3, || {
+            Ok(super::columns::conv2d(&xs, &weight, 1, 1, usize::MAX)?)
+        })?;
+        println!(
+            "C={channels} {height}x{width}: group norm {group_norm:.1} ms, silu {silu:.1} ms, add {add:.1} ms, bias add {bias_add:.1} ms, upsample {upsample:.1} ms, conv banded {banded:.1} ms, conv one band {whole:.1} ms"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Metal device; prints timings"]
+fn metal_elementwise_dispatch_costs() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let xs = Tensor::randn(0f32, 1f32, (1, 128, 384, 640), &device)?;
+    let other = Tensor::randn(0f32, 1f32, (1, 128, 384, 640), &device)?;
+    for round in 0..2 {
+        let silu = time(&device, 5, || Ok(candle_nn::ops::silu(&xs)?))?;
+        let affine = time(&device, 5, || Ok(xs.affine(2.0, 1.0)?))?;
+        let add = time(&device, 5, || Ok((&xs + &other)?))?;
+        let mul = time(&device, 5, || Ok((&xs * &other)?))?;
+        let sqr = time(&device, 5, || Ok(xs.sqr()?))?;
+        let sum = time(&device, 5, || {
+            Ok(xs.reshape((1, 32, 4 * 384 * 640))?.sum_keepdim(2)?)
+        })?;
+        println!(
+            "round {round}: silu {silu:.1} affine {affine:.1} add {add:.1} mul {mul:.1} sqr {sqr:.1} sum {sum:.1} ms"
+        );
+    }
+    Ok(())
+}
