@@ -10,8 +10,8 @@ use crate::{
     artifact::{ArtifactLimits, Manifest, ModelBundle},
     native::NativeModel,
     pipeline::{
-        InferenceInput, InferenceLimits, InferenceResult, ModelBackend, Pipeline, PipelineConfig,
-        Stage,
+        CancellationToken, Checkpoint, InferenceInput, InferenceLimits, InferenceResult,
+        ModelBackend, Pipeline, PipelineConfig, Stage,
     },
     scheduler::Scheduler,
 };
@@ -101,27 +101,35 @@ enum RuntimeModel {
 }
 
 impl ModelBackend for RuntimeModel {
-    fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
+    fn encode_moments(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         match self {
-            Self::Native(model) => model.encode_moments(image),
+            Self::Native(model) => ModelBackend::encode_moments(model.as_ref(), image, checkpoint),
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(model) => model.encode_moments(image),
+            Self::Wgpu(model) => model.encode_moments(image, checkpoint),
         }
     }
 
-    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+    fn denoise(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         match self {
-            Self::Native(model) => model.denoise(input, timestep, time_ids),
+            Self::Native(model) => {
+                ModelBackend::denoise(model.as_ref(), input, timestep, time_ids, checkpoint)
+            }
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(model) => model.denoise(input, timestep, time_ids),
+            Self::Wgpu(model) => model.denoise(input, timestep, time_ids, checkpoint),
         }
     }
 
-    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+    fn decode(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         match self {
-            Self::Native(model) => model.decode(latents),
+            Self::Native(model) => ModelBackend::decode(model.as_ref(), latents, checkpoint),
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(model) => model.decode(latents),
+            Self::Wgpu(model) => model.decode(latents, checkpoint),
         }
     }
 }
@@ -444,6 +452,20 @@ impl Osor {
         self.pipeline.infer_with_observer(input, observer)
     }
 
+    /// Run one job that stops with [`Error::Cancelled`] once `cancellation`
+    /// is cancelled, at the next stage boundary or backend block checkpoint.
+    /// CPU work stops between encoder, UNet and decoder blocks; queued GPU
+    /// work completes first.
+    pub fn infer_with_cancellation(
+        &self,
+        input: InferenceInput<'_>,
+        cancellation: &CancellationToken,
+        observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
+    ) -> Result<InferenceResult> {
+        self.pipeline
+            .infer_with_cancellation(input, cancellation, observer)
+    }
+
     /// Measure completed device work between reference stages. Synchronization
     /// adds profiling overhead; use `infer` when measuring normal throughput.
     pub fn infer_profiled(
@@ -476,16 +498,22 @@ impl Osor {
 }
 
 impl ModelBackend for NativeModel {
-    fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
-        NativeModel::encode_moments(self, image)
+    fn encode_moments(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+        self.encode_moments_checked(image, checkpoint)
     }
 
-    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
-        NativeModel::denoise(self, input, timestep, time_ids)
+    fn denoise(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
+        self.denoise_checked(input, timestep, time_ids, checkpoint)
     }
 
-    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        NativeModel::decode(self, latents)
+    fn decode(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+        self.decode_checked(latents, checkpoint)
     }
 }
 

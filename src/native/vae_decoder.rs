@@ -8,7 +8,7 @@ use candle_nn::{self as nn, Module, VarBuilder};
 use super::Architecture;
 use super::conv::{BandedConv2d, conv2d};
 use super::vae_encoder::{MidBlock, Resnet, StableGroupNorm};
-use crate::Result;
+use crate::{Result, pipeline::Checkpoint};
 
 struct UpBlock {
     resnets: Vec<Resnet>,
@@ -16,12 +16,14 @@ struct UpBlock {
 }
 
 impl UpBlock {
-    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(&self, input: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         let mut xs = input.clone();
         for resnet in &self.resnets {
+            checkpoint()?;
             xs = resnet.forward(&xs)?;
         }
-        match &self.upsample {
+        checkpoint()?;
+        Ok(match &self.upsample {
             Some(conv) => {
                 let (_, _, height, width) = xs.dims4()?;
                 let height = height
@@ -30,10 +32,10 @@ impl UpBlock {
                 let width = width
                     .checked_mul(2)
                     .ok_or_else(|| candle_core::Error::Msg("upsample width overflow".into()))?;
-                conv.forward(&xs.upsample_nearest2d(height, width)?)
+                conv.forward(&xs.upsample_nearest2d(height, width)?)?
             }
-            None => Ok(xs),
-        }
+            None => xs,
+        })
     }
 }
 
@@ -89,13 +91,14 @@ impl VaeDecoder {
     }
 
     /// Decode unscaled latents into raw RGB in approximately [-1, 1].
-    pub(super) fn forward(&self, latents: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         let xs = self
             .conv_in
             .forward(&self.post_quant_conv.forward(latents)?)?;
+        checkpoint()?;
         let mut xs = self.mid.forward(&xs, None)?;
         for block in &self.up {
-            xs = block.forward(&xs)?;
+            xs = block.forward(&xs, checkpoint)?;
         }
         let xs = nn::ops::silu(&self.norm_out.forward(&xs)?)?;
         Ok(self.conv_out.forward(&xs)?)
@@ -147,7 +150,7 @@ mod tests {
         // normalization reduces at most 256 elements in a single pass.
         let latents = Tensor::randn(0f32, 1f32, (2, 4, 2, 2), device)?;
         let expected = candle.decode(&latents)?;
-        let actual = ours.forward(&latents)?;
+        let actual = ours.forward(&latents, &|| Ok(()))?;
         assert_eq!(actual.dims(), &[2, 3, 16, 16]);
         let difference = (actual - expected)?
             .abs()?

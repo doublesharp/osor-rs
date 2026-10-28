@@ -5,7 +5,7 @@ use candle_nn::{self as nn, Module, VarBuilder};
 
 use super::Architecture;
 use super::conv::{BandedConv2d, conv2d};
-use crate::Result;
+use crate::{Result, pipeline::Checkpoint};
 
 const GROUPS: usize = 32;
 const EPS: f64 = 1e-6;
@@ -161,20 +161,33 @@ impl DownBlock {
     }
 }
 
-impl Module for DownBlock {
-    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+impl DownBlock {
+    pub(super) fn forward_checked(
+        &self,
+        input: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         let mut xs = input.clone();
         for resnet in &self.resnets {
+            checkpoint()?;
             xs = resnet.forward(&xs)?;
         }
-        match &self.downsample {
+        checkpoint()?;
+        Ok(match &self.downsample {
             Some(conv) => conv.forward(&xs.pad_with_zeros(D::Minus1, 0, 1)?.pad_with_zeros(
                 D::Minus2,
                 0,
                 1,
-            )?),
-            None => Ok(xs),
-        }
+            )?)?,
+            None => xs,
+        })
+    }
+}
+
+impl Module for DownBlock {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_checked(input, &|| Ok(()))
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 }
 
@@ -317,11 +330,12 @@ impl VaeEncoder {
         })
     }
 
-    pub(super) fn forward(&self, image: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
         let mut xs = self.conv_in.forward(image)?;
         for block in &self.down {
-            xs = block.forward(&xs)?;
+            xs = block.forward_checked(&xs, checkpoint)?;
         }
+        checkpoint()?;
         xs = self.mid.forward(&xs, None)?;
         xs = nn::ops::silu(&self.norm_out.forward(&xs)?)?;
         Ok(self.quant_conv.forward(&self.conv_out.forward(&xs)?)?)

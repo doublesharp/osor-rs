@@ -20,7 +20,7 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 
 use crate::{
     Error, Result,
-    pipeline::{ModelBackend, valid_image_axis},
+    pipeline::{Checkpoint, ModelBackend, valid_image_axis},
 };
 
 /// WGPU admission bound on image pixels; batch is limited to one.
@@ -417,8 +417,10 @@ impl WgpuModel {
     }
 }
 
+// The WGPU graph is queued as a whole, so checkpoints run once per call.
 impl ModelBackend for WgpuModel {
-    fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
+    fn encode_moments(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+        checkpoint()?;
         guarded_model(&self.generation, "VAE encode", || {
             let [b, _, h, w] = image_shape(image, 3, false, "image")?;
             let values = cpu_values(image, "image", &[b, 3, h, w], false)?;
@@ -440,7 +442,14 @@ impl ModelBackend for WgpuModel {
         })
     }
 
-    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+    fn denoise(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
+        checkpoint()?;
         guarded_model(&self.generation, "UNet", || {
             let [b, _, h, w] = image_shape(input, 9, true, "UNet input")?;
             if timestep >= 100_000 {
@@ -459,7 +468,8 @@ impl ModelBackend for WgpuModel {
         })
     }
 
-    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+    fn decode(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+        checkpoint()?;
         guarded_model(&self.generation, "VAE decode", || {
             let [b, _, h, w] = image_shape(latents, 4, true, "latents")?;
             let input = upload(latents, "latents", [b, 4, h, w], &self.generation.device)?;

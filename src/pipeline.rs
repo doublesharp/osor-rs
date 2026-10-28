@@ -1,19 +1,70 @@
 //! Explicit-noise OSOR inference, independent of a particular model backend.
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use crate::{Error, Result, scheduler::Scheduler};
 use candle_core::{DType, Tensor};
+
+/// Called by backends between neural blocks; returns [`Error::Cancelled`] to
+/// stop the job.
+pub type Checkpoint<'a> = &'a dyn Fn() -> Result<()>;
+
+/// Shared flag that stops an inference at its next checkpoint.
+///
+/// Clone it to another thread and call [`Self::cancel`]. Native CPU work stops
+/// between encoder, UNet and decoder blocks. GPU backends queue work ahead of
+/// the CPU, so already queued GPU work still completes before the job returns
+/// [`Error::Cancelled`].
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// A token that has not been cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation; every clone observes it.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation was requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Return [`Error::Cancelled`] once cancellation was requested.
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Model operations used by the deterministic pipeline.
 ///
 /// Backends bind the bundle's fixed prompt and pooled embeddings when they are
-/// constructed; `denoise` receives only per-job inputs.
+/// constructed; `denoise` receives only per-job inputs. Each method calls
+/// `checkpoint` between blocks it can interrupt.
 pub trait ModelBackend {
     /// Return the raw eight-channel posterior mean and log-variance for a
     /// normalized `[-1, 1]` image.
-    fn encode_moments(&self, image: &Tensor) -> Result<Tensor>;
+    fn encode_moments(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor>;
     /// Return four denoising channels followed by the alpha logit.
-    fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor>;
+    fn denoise(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor>;
     /// Decode unscaled four-channel latents into raw RGB.
-    fn decode(&self, latents: &Tensor) -> Result<Tensor>;
+    fn decode(&self, latents: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor>;
 }
 
 /// Smallest accepted image height or width.
@@ -309,6 +360,35 @@ impl<B: ModelBackend> Pipeline<B> {
         input: InferenceInput<'_>,
         observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
     ) -> Result<InferenceResult> {
+        self.run(input, observer, &|| Ok(()))
+    }
+
+    /// Run one job that stops with [`Error::Cancelled`] at the next stage or
+    /// backend block checkpoint after `cancellation` is cancelled.
+    pub fn infer_with_cancellation(
+        &self,
+        input: InferenceInput<'_>,
+        cancellation: &CancellationToken,
+        observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
+    ) -> Result<InferenceResult> {
+        let checkpoint = || cancellation.check();
+        self.run(
+            input,
+            &mut |stage, tensor| {
+                cancellation.check()?;
+                observer(stage, tensor)
+            },
+            &checkpoint,
+        )
+    }
+
+    fn run(
+        &self,
+        input: InferenceInput<'_>,
+        observer: &mut dyn FnMut(Stage, &Tensor) -> Result<()>,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<InferenceResult> {
+        checkpoint()?;
         let (batch, channels, height, width) = input
             .image
             .dims4()
@@ -368,7 +448,7 @@ impl<B: ModelBackend> Pipeline<B> {
             None,
         )?;
         let normalized = input.image.affine(2.0, -1.0)?.to_dtype(dtype)?;
-        let moments = self.backend.encode_moments(&normalized)?;
+        let moments = self.backend.encode_moments(&normalized, checkpoint)?;
         validate_tensor(
             &moments,
             "posterior moments",
@@ -447,7 +527,7 @@ impl<B: ModelBackend> Pipeline<B> {
         observer(Stage::TimeIds, &ids)?;
         let output = self
             .backend
-            .denoise(&unet_input, self.config.timestep, &ids)?;
+            .denoise(&unet_input, self.config.timestep, &ids, checkpoint)?;
         validate_tensor(
             &output,
             "denoiser output",
@@ -481,9 +561,10 @@ impl<B: ModelBackend> Pipeline<B> {
             + latent_alpha.affine(-1.0, 1.0)?.broadcast_mul(&original)?)?;
         validate_tensor(&blend, "blended latent", &latent_shape, dtype, device, None)?;
         observer(Stage::BlendedLatent, &blend)?;
-        let decoded = self
-            .backend
-            .decode(&blend.affine(1.0 / self.config.vae_scaling_factor, 0.0)?)?;
+        let decoded = self.backend.decode(
+            &blend.affine(1.0 / self.config.vae_scaling_factor, 0.0)?,
+            checkpoint,
+        )?;
         validate_tensor(
             &decoded,
             "decoded image",
@@ -562,14 +643,21 @@ mod tests {
         encodes: Cell<usize>,
     }
     impl ModelBackend for Synthetic {
-        fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
+        fn encode_moments(&self, image: &Tensor, checkpoint: Checkpoint<'_>) -> Result<Tensor> {
+            checkpoint()?;
             self.encodes.set(self.encodes.get() + 1);
             let (b, _, h, w) = image.dims4()?;
             let mean = Tensor::full(2f32, (b, 4, h / 8, w / 8), image.device())?;
             let logvar = Tensor::zeros((b, 4, h / 8, w / 8), DType::F32, image.device())?;
             Ok(Tensor::cat(&[&mean, &logvar], 1)?)
         }
-        fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+        fn denoise(
+            &self,
+            input: &Tensor,
+            timestep: usize,
+            time_ids: &Tensor,
+            _: Checkpoint<'_>,
+        ) -> Result<Tensor> {
             assert_eq!(timestep, 0);
             *self.time_ids.borrow_mut() = Some(time_ids.clone());
             let (b, c, h, w) = input.dims4()?;
@@ -578,7 +666,7 @@ mod tests {
             let logits = Tensor::zeros((b, 1, h, w), DType::F32, input.device())?;
             Ok(Tensor::cat(&[&eps, &logits], 1)?)
         }
-        fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        fn decode(&self, latents: &Tensor, _: Checkpoint<'_>) -> Result<Tensor> {
             *self.decoded.borrow_mut() = Some(latents.clone());
             let (_, _, h, w) = latents.dims4()?;
             Ok(latents.narrow(1, 0, 3)?.upsample_nearest2d(h * 8, w * 8)?)
@@ -620,7 +708,7 @@ mod tests {
     fn half_precision_decoder_is_mapped_and_interpolated_in_f32() -> Result<()> {
         struct Half;
         impl ModelBackend for Half {
-            fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
+            fn encode_moments(&self, image: &Tensor, _: Checkpoint<'_>) -> Result<Tensor> {
                 let (b, _, h, w) = image.dims4()?;
                 Ok(Tensor::zeros(
                     (b, 8, h / 8, w / 8),
@@ -628,11 +716,17 @@ mod tests {
                     image.device(),
                 )?)
             }
-            fn denoise(&self, input: &Tensor, _: usize, _: &Tensor) -> Result<Tensor> {
+            fn denoise(
+                &self,
+                input: &Tensor,
+                _: usize,
+                _: &Tensor,
+                _: Checkpoint<'_>,
+            ) -> Result<Tensor> {
                 let (b, _, h, w) = input.dims4()?;
                 Ok(Tensor::zeros((b, 5, h, w), DType::BF16, input.device())?)
             }
-            fn decode(&self, input: &Tensor) -> Result<Tensor> {
+            fn decode(&self, input: &Tensor, _: Checkpoint<'_>) -> Result<Tensor> {
                 let (b, _, h, w) = input.dims4()?;
                 Ok(
                     Tensor::full(0.001_f32, (b, 3, h * 8, w * 8), input.device())?
@@ -831,6 +925,44 @@ mod tests {
         ));
         assert_eq!(count, 1);
         assert!(p.backend.decoded.borrow().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_token_stops_before_and_between_stages() -> Result<()> {
+        let p = pipeline()?;
+        let image = Tensor::zeros((1, 3, 32, 32), DType::F32, &Device::Cpu)?;
+        let mask = Tensor::zeros((1, 1, 32, 32), DType::F32, &Device::Cpu)?;
+        let noise = Tensor::zeros((1, 4, 4, 4), DType::F32, &Device::Cpu)?;
+        let input = || InferenceInput {
+            image: &image,
+            mask: &mask,
+            posterior_noise: &noise,
+            diffusion_noise: &noise,
+        };
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            p.infer_with_cancellation(input(), &cancelled, &mut |_, _| Ok(())),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(p.backend.encodes.get(), 0);
+        // Cancelling from another holder during the job stops at the next stage.
+        let token = CancellationToken::new();
+        let remote = token.clone();
+        let mut seen = Vec::new();
+        let result = p.infer_with_cancellation(input(), &token, &mut |stage, _| {
+            seen.push(stage);
+            if stage == Stage::PooledMask {
+                remote.cancel();
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(seen.last(), Some(&Stage::PooledMask));
+        assert!(p.backend.time_ids.borrow().is_none());
+        // An uncancelled token completes normally.
+        p.infer_with_cancellation(input(), &CancellationToken::new(), &mut |_, _| Ok(()))?;
         Ok(())
     }
 

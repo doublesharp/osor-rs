@@ -17,7 +17,7 @@ pub mod tensor_io;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
 
-pub use pipeline::{InferenceInput, InferenceLimits, InferenceResult, Stage};
+pub use pipeline::{CancellationToken, InferenceInput, InferenceLimits, InferenceResult, Stage};
 pub use runtime::{Backend, LoadOptions, Osor, OsorBuilder};
 
 pub use candle_core::{DType, Device, Tensor};

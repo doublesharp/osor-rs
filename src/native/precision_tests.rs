@@ -182,11 +182,11 @@ fn vae_cpu_same_input_reference() -> Result<()> {
     let moments = if let Some(output) = std::env::var_os("OSOR_VAE_TRACE_CAPTURE") {
         trace_encoder(&encoder, image, Path::new(&output))?
     } else {
-        encoder.forward(image)?
+        encoder.forward(image, &|| Ok(()))?
     };
     let mut actual = HashMap::from([("posterior_moments".into(), moments)]);
     if let Some(vae) = vae {
-        actual.insert("decoded_raw".into(), vae.forward(latent)?);
+        actual.insert("decoded_raw".into(), vae.forward(latent, &|| Ok(()))?);
     }
     let reports = if encoder_only {
         let moments_reference = input(&expected, "posterior_moments")?.clone();

@@ -23,7 +23,7 @@ use candle_transformers::models::stable_diffusion::{
 
 use crate::{
     Error, Result,
-    pipeline::{IMAGE_AXIS_MULTIPLE, MAX_BATCH, MAX_IMAGE_AXIS, MIN_IMAGE_AXIS},
+    pipeline::{Checkpoint, IMAGE_AXIS_MULTIPLE, MAX_BATCH, MAX_IMAGE_AXIS, MIN_IMAGE_AXIS},
 };
 use cross_blocks::{CrossConfig, CrossDown, CrossMid, CrossUp};
 use vae_decoder::VaeDecoder;
@@ -260,7 +260,13 @@ impl Unet {
         })
     }
 
-    fn forward(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         let (batch, channels, h, w) = input.dims4().map_err(|_| {
             Error::InvalidInput("UNet input must have shape [batch,9,height,width]".into())
         })?;
@@ -311,6 +317,7 @@ impl Unet {
         let mut xs = self.conv_in.forward(input)?;
         let mut residuals = vec![xs.clone()];
         for block in &self.down {
+            checkpoint()?;
             let (next, saved) = match block {
                 Down::Plain(b) => b.forward(&xs, Some(&emb))?,
                 Down::Cross(b) => b.forward(&xs, Some(&emb))?,
@@ -318,8 +325,10 @@ impl Unet {
             xs = next;
             residuals.extend(saved);
         }
+        checkpoint()?;
         xs = self.mid.forward(&xs, Some(&emb))?;
         for (index, block) in self.up.iter().enumerate() {
+            checkpoint()?;
             let count = match block {
                 Up::Plain(b) => b.resnets.len(),
                 Up::Cross(b) => b.residual_count(),
@@ -456,6 +465,14 @@ impl NativeModel {
 
     /// Return the unmodified eight-channel mean/log-variance posterior parameters.
     pub fn encode_moments(&self, image: &Tensor) -> Result<Tensor> {
+        self.encode_moments_checked(image, &|| Ok(()))
+    }
+
+    pub(crate) fn encode_moments_checked(
+        &self,
+        image: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         self.validate_image(
             image,
             3,
@@ -464,20 +481,38 @@ impl NativeModel {
             IMAGE_AXIS_MULTIPLE,
             "image",
         )?;
-        self.encoder.forward(image)
+        self.encoder.forward(image, checkpoint)
     }
 
     /// Run the five-channel SDXL UNet with the bound prompt conditioning and
     /// per-call SDXL time IDs.
     pub fn denoise(&self, input: &Tensor, timestep: usize, time_ids: &Tensor) -> Result<Tensor> {
+        self.denoise_checked(input, timestep, time_ids, &|| Ok(()))
+    }
+
+    pub(crate) fn denoise_checked(
+        &self,
+        input: &Tensor,
+        timestep: usize,
+        time_ids: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         self.validate_image(input, 9, MIN_LATENT_AXIS, MAX_LATENT_AXIS, 1, "UNet input")?;
-        self.unet.forward(input, timestep, time_ids)
+        self.unet.forward(input, timestep, time_ids, checkpoint)
     }
 
     /// Decode unscaled four-channel VAE latents into the raw RGB output.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        self.decode_checked(latents, &|| Ok(()))
+    }
+
+    pub(crate) fn decode_checked(
+        &self,
+        latents: &Tensor,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<Tensor> {
         self.validate_image(latents, 4, 1, MAX_LATENT_AXIS, 1, "latents")?;
-        self.decoder.forward(latents)
+        self.decoder.forward(latents, checkpoint)
     }
 }
 
@@ -604,6 +639,57 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_run_between_blocks_and_stop_each_stage() -> Result<()> {
+        use std::cell::Cell;
+        let m = tiny_model()?;
+        let device = &Device::Cpu;
+        let image = Tensor::randn(0f32, 1f32, (1, 3, 32, 32), device)?;
+        let latent = Tensor::randn(0f32, 1f32, (1, 4, 4, 4), device)?;
+        let input = Tensor::randn(0f32, 1f32, (1, 9, 4, 4), device)?;
+        let ids = Tensor::new(&[[32f32, 32., 0., 0., 32., 32.]], device)?;
+        let count = Cell::new(0_usize);
+        let counting = || {
+            count.set(count.get() + 1);
+            Ok(())
+        };
+        m.encode_moments_checked(&image, &counting)?;
+        let encode = count.take();
+        m.denoise_checked(&input, 400, &ids, &counting)?;
+        let denoise = count.take();
+        m.decode_checked(&latent, &counting)?;
+        let decode = count.take();
+        // Four encoder down blocks, three UNet down and up blocks plus the
+        // middle, and four decoder up blocks each give several checkpoints.
+        assert!(encode >= 8, "encoder checkpoints {encode}");
+        assert!(denoise >= 7, "UNet checkpoints {denoise}");
+        assert!(decode >= 12, "decoder checkpoints {decode}");
+        let calls = Cell::new(0_usize);
+        let cancel_second = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            m.encode_moments_checked(&image, &cancel_second),
+            Err(Error::Cancelled)
+        ));
+        calls.set(0);
+        assert!(matches!(
+            m.denoise_checked(&input, 400, &ids, &cancel_second),
+            Err(Error::Cancelled)
+        ));
+        calls.set(0);
+        assert!(matches!(
+            m.decode_checked(&latent, &cancel_second),
+            Err(Error::Cancelled)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn tiny_complete_graph_preserves_nonsquare_odd_latent_shape() -> Result<()> {
         let m = tiny_model()?;
         let device = &Device::Cpu;
@@ -659,8 +745,8 @@ mod tests {
         )?;
         let image = Tensor::randn(0f32, 1f32, (1, 3, 32, 32), &device)?;
         assert!(!differs(
-            &reference.forward(&image)?,
-            &converted.forward(&image)?
+            &reference.forward(&image, &|| Ok(()))?,
+            &converted.forward(&image, &|| Ok(()))?
         )?);
         renamed.remove("encoder.mid_block.attentions.0.to_v.weight");
         assert!(
