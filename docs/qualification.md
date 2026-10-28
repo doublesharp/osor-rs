@@ -46,6 +46,17 @@ The bundle manifest identifies the exact source revisions, licenses, conversion-
 
 ## Remaining gates
 
+The additive handle-based `conversion::convert_with_io` API reproduced all
+three preserved bundle file hashes and the exact serialized manifest from the
+four original inputs on macOS. Its digest-only sink wrote no weight files.
+This checks full input verification, adapter merging, graph validation, output
+encoding and manifest publication ordering without rerunning inference. The
+mirror's different F32 prompt requires its own numerical qualification.
+Cancellation, changed input bytes, decoded-byte limits and sink failures have
+focused synthetic regressions. Independent Terra review accepted the
+conversion boundary after a manifest-size preflight correction. Raw receipts
+remain under `/Volumes/Scratch/osor-rs/reports/capability-conversion-20261028`.
+
 The additive manifest-pinning API passed its three behavioral regressions, final CPU and accelerator gates, and a real-bundle Metal load followed by all 18 small-case comparisons. A subsequent limits-aware API adds caller-owned decoded-weight admission without changing the original API. Its small F16 fixtures verify target-dtype expansion, cross-file aggregation, exact budget boundaries and rejection before graph validation. The preserved bundle contains 10,605,175,216 decoded F32 bytes (about 9.88 GiB); loading it under a 24 GiB cap and running all 18 Metal reference comparisons passed.
 
 Final CPU gates passed 43 ordinary tests; Metal/WGPU gates passed 45. Strict Clippy, formatting, doctests and CPU source cross-checks passed. Independent Terra source reviews accepted both the manifest pin and the caller-limit follow-up with no P1/P2 findings. These reviews cover the loading boundaries, not the entire neural implementation; the earlier normalization-specific independent review was unavailable due to capacity.

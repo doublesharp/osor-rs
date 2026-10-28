@@ -2,17 +2,21 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    io::Read,
+    io::{Read, Write},
     path::PathBuf,
 };
 
 use osor_rs::{
     Backend, DType, Device, Error, InferenceInput, LoadOptions, Osor, Result,
-    artifact::{ArtifactLimits, ModelBundle},
+    artifact::{ArtifactLimits, Manifest, ModelBundle},
+    conversion::{
+        ConversionOptions, ConversionOutput, ConversionReaders, ConversionSink, convert_with_io,
+    },
     native::NativeModel,
     parity::{Tolerance, compare_reference_stages},
     tensor_io,
 };
+use sha2::{Digest, Sha256};
 
 fn path(name: &str) -> Result<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
@@ -170,5 +174,138 @@ fn real_model_missing_critical_weights_fail() -> Result<()> {
         NativeModel::new(bundle.unet, missing_vae, DType::F32, &Device::Cpu),
         Err(Error::InvalidArtifact(_))
     ));
+    Ok(())
+}
+
+#[derive(Default)]
+struct DigestWriter {
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.digest.update(bytes);
+        self.bytes += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DigestSink {
+    finished: Vec<(ConversionOutput, u64, String)>,
+    manifest: Vec<u8>,
+}
+
+impl ConversionSink for DigestSink {
+    type Writer = DigestWriter;
+    fn create_new(&mut self, output: ConversionOutput) -> Result<Self::Writer> {
+        let order = [
+            ConversionOutput::Unet,
+            ConversionOutput::Vae,
+            ConversionOutput::Prompt,
+        ];
+        if order.get(self.finished.len()) != Some(&output) {
+            return Err(Error::InvalidInput("unexpected output order".into()));
+        }
+        Ok(DigestWriter::default())
+    }
+    fn finish(&mut self, output: ConversionOutput, writer: Self::Writer) -> Result<()> {
+        self.finished.push((
+            output,
+            writer.bytes,
+            format!("{:x}", writer.digest.finalize()),
+        ));
+        Ok(())
+    }
+    fn publish_manifest(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.finished.len() != 3 || !self.manifest.is_empty() {
+            return Err(Error::InvalidInput(
+                "unexpected manifest publication".into(),
+            ));
+        }
+        self.manifest.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires four installed conversion inputs and a pinned qualified bundle; hashes outputs without saving weights"]
+fn real_model_conversion_io_matches_qualified_bundle() -> Result<()> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path("OSOR_TEST_BUNDLE")?.join("manifest.json"))?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Error::InvalidInput("manifest exceeds 1 MiB".into()));
+    }
+    let expected_pin = std::env::var("OSOR_TEST_MANIFEST_SHA256")
+        .map_err(|_| Error::InvalidInput("set OSOR_TEST_MANIFEST_SHA256".into()))?;
+    let actual_pin = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(actual_pin, expected_pin.to_ascii_lowercase());
+    let expected: Manifest = serde_json::from_slice(&bytes)?;
+    expected.validate()?;
+    let options = ConversionOptions {
+        base_model_source: expected.base_model.clone(),
+        vae_source: expected.vae_model.clone(),
+        checkpoint_source: expected.checkpoint.clone(),
+        prompt_source: expected.prompt.clone(),
+        config_source: expected.config.clone(),
+        expected_input_sha256: expected.input_sha256.clone(),
+        scheduler: expected.scheduler.clone(),
+        limits: ArtifactLimits {
+            max_total_tensor_bytes: 14 * 1024 * 1024 * 1024,
+            ..ArtifactLimits::default()
+        },
+    };
+    let mut base_unet = std::fs::File::open(path("OSOR_TEST_BASE_UNET")?)?;
+    let mut base_vae = std::fs::File::open(path("OSOR_TEST_BASE_VAE")?)?;
+    let mut checkpoint = std::fs::File::open(path("OSOR_TEST_CHECKPOINT")?)?;
+    let mut prompt = std::fs::File::open(path("OSOR_TEST_PROMPT")?)?;
+    let mut sink = DigestSink::default();
+    let start = std::time::Instant::now();
+    let converted = convert_with_io(
+        &options,
+        ConversionReaders {
+            base_unet: &mut base_unet,
+            base_vae: &mut base_vae,
+            checkpoint: &mut checkpoint,
+            prompt: &mut prompt,
+        },
+        &mut sink,
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(sink.finished.len(), 3);
+    for (output, _, digest) in &sink.finished {
+        let expected_digest = match output {
+            ConversionOutput::Unet => &expected.sha256.unet,
+            ConversionOutput::Vae => &expected.sha256.vae,
+            ConversionOutput::Prompt => &expected.sha256.prompt,
+        };
+        assert_eq!(digest, expected_digest);
+    }
+    assert_eq!(
+        serde_json::to_vec(&converted)?,
+        serde_json::to_vec(&expected)?
+    );
+    assert_eq!(sink.manifest, serde_json::to_vec_pretty(&expected)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "test": "conversion_io_matches_qualified_bundle",
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "trusted_manifest_sha256": actual_pin,
+            "elapsed_seconds": start.elapsed().as_secs_f64(),
+            "max_decoded_input_bytes": options.limits.max_total_tensor_bytes,
+            "finished_outputs": sink.finished.iter().map(|(output, bytes, sha256)| {
+                serde_json::json!({"output": output.file_name(), "bytes": bytes, "sha256": sha256})
+            }).collect::<Vec<_>>(),
+            "output_weight_files_written": false,
+        }))?
+    );
     Ok(())
 }

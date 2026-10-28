@@ -63,6 +63,67 @@ the synthetic tests nor a successfully converted bundle establish numerical
 parity with the released model; that requires the exact artifacts and captured
 reference intermediates.
 
+## Conversion through held capabilities
+
+Installers that hold directory capabilities can use the additive
+`conversion::convert_with_io(&options, readers, &mut sink, &mut checkpoint)`.
+`ConversionReaders` borrows four already-open `Read + Seek` sources as
+`base_unet`, `base_vae`, `checkpoint`, and `prompt`. Conversion seeks from byte
+zero and never opens or reopens a path. `ConversionOptions` contains the same
+source provenance and scheduler as `ConversionRequest`, plus trusted
+`expected_input_sha256: InputDigests` and `limits: ArtifactLimits`.
+
+The application implements this output boundary:
+
+```rust
+use std::io::Write;
+use osor_rs::{Result, conversion::ConversionOutput};
+
+trait ConversionSink {
+    type Writer: Write;
+    fn create_new(&mut self, output: ConversionOutput) -> Result<Self::Writer>;
+    fn finish(&mut self, output: ConversionOutput, writer: Self::Writer) -> Result<()>;
+    fn publish_manifest(&mut self, bytes: &[u8]) -> Result<()>;
+}
+```
+
+Implement the library's `osor_rs::conversion::ConversionSink` trait; the
+declaration above shows its signatures. `ConversionOutput::{Unet,Vae,Prompt}`
+maps to the fixed bundle filenames through `file_name()`. The caller creates
+each writer exclusively through its held directory, performs durability checks
+in `finish`, and publishes the manifest atomically and exclusively through that
+same directory in `publish_manifest`. The library flushes each writer before
+`finish`. It never removes partial files, retries publication, or supplies an
+ambient output path. The caller owns cleanup and must reconcile a publication
+error if its implementation may have committed before returning the error.
+
+All four input headers, aggregate F32 decoded sizes, and trusted whole-file
+hashes are checked before any weight tensors are constructed. During decoding,
+the converter checks the original size and header and verifies each tensor's
+raw bytes against its preflight digest before constructing that tensor. This
+binds decoding to verified bytes even when an open source can be modified.
+Limits include temporary checkpoint tensors: the preserved recipe needs
+13,716,870,592 decoded input bytes, whereas its final model needs
+10,605,175,216. A runtime model cap of 12 GiB therefore cannot also serve as
+this recipe's conversion cap. Input and output aggregates are checked
+separately; neither is a peak RSS bound. Budget merging and other transient
+storage separately. The full native graph, all three output plans, and manifest
+size are validated before creating any output writer.
+
+The callback receives `ConversionEvent` during verification, decoding, adapter
+merging, model validation, output writing, and immediately before publication.
+Return `Error::Cancelled` to stop. Transfers have checkpoints at most 64 KiB
+apart; merges have checkpoints between adapter updates. Individual tensor
+construction, neural operations, caller I/O methods, and synchronization remain
+synchronous. Cancellation may leave partial unpublished outputs for caller
+cleanup. There is no fallible callback after successful manifest publication.
+The original path-based `convert` API retains its behavior.
+
+Expected hashes must come from the installer's trusted recipe. The mirror's
+F32 prompt and the preserved qualified F16 export are distinct inputs; changing
+the recipe requires independent numerical qualification. This API adds no
+network access or automatic download.
+
 ## Pinning an imported bundle
 
 Applications that approve a multi-file bundle without copying its weights can retain a trusted SHA-256 of the exact imported manifest bytes and pass it to `Osor::load_with_options_and_manifest_sha256(path, options, expected_manifest_sha256)`. The loader reads a bounded manifest buffer, verifies its digest, and parses that same buffer. A mismatch fails before any weight-file read or weight allocation. The existing tensor loader then hashes the exact bytes used to construct tensors against the verified manifest's digests.

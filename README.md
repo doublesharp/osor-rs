@@ -147,6 +147,11 @@ scripts/cargo.sh run --locked --bin osor -- convert /path/to/conversion.json
 
 It validates critical weights and shapes, records source revisions and SHA-256 hashes, and creates a new bundle. Export released pickle-based checkpoints only in an isolated development environment outside this repository; the Rust converter never executes pickle. See the [artifact contract](docs/artifacts.md) for the conversion schema, provenance, and licensing requirements.
 
+Installers holding directory capabilities can use `conversion::convert_with_io`
+with already-open sources, trusted input hashes, caller limits, cancellation
+checkpoints, and exclusive output sinks. See [conversion through held
+capabilities](docs/artifacts.md#conversion-through-held-capabilities).
+
 <details>
 <summary>Run the local inference example and CLI</summary>
 

@@ -1,5 +1,11 @@
 //! Offline conversion of already-exported local Phase II safetensors.
 
+mod io;
+pub use io::{
+    ConversionEvent, ConversionInput, ConversionOptions, ConversionOutput, ConversionReaders,
+    ConversionSink, ReadSeek, convert_with_io,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -267,10 +273,20 @@ fn adapter_part(name: &str) -> Option<(&str, bool)> {
 }
 
 fn merge_checkpoint(
+    base: HashMap<String, Tensor>,
+    checkpoint: HashMap<String, Tensor>,
+    rank: usize,
+    alpha: f64,
+) -> Result<HashMap<String, Tensor>> {
+    merge_checkpoint_with_progress(base, checkpoint, rank, alpha, &mut |_, _| Ok(()))
+}
+
+fn merge_checkpoint_with_progress(
     mut base: HashMap<String, Tensor>,
     checkpoint: HashMap<String, Tensor>,
     rank: usize,
     alpha: f64,
+    progress: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<HashMap<String, Tensor>> {
     let mut expected = BTreeSet::new();
     let mut kinds = BTreeSet::new();
@@ -289,6 +305,8 @@ fn merge_checkpoint(
             )));
         }
     }
+    let total = expected.len();
+    progress(0, total)?;
 
     let mut pairs: BTreeMap<String, Pair> = BTreeMap::new();
     let mut seen = BTreeSet::new();
@@ -324,6 +342,7 @@ fn merge_checkpoint(
             let original = base.get(&canonical).ok_or_else(|| {
                 artifact_error(format!("unexpected checkpoint tensor {canonical}"))
             })?;
+            progress(0, total)?;
             if !same_values(original, &tensor)? {
                 return Err(artifact_error(format!(
                     "checkpoint base tensor differs from supplied base: {canonical}"
@@ -338,7 +357,8 @@ fn merge_checkpoint(
             "trained conv_out must have weight [5, 320, 3, 3] and bias [5]",
         ));
     }
-    for module in expected {
+    for (index, module) in expected.into_iter().enumerate() {
+        progress(index, total)?;
         let pair = pairs
             .remove(&module)
             .ok_or_else(|| artifact_error(format!("missing adapter A and B for {module}")))?;
@@ -354,6 +374,7 @@ fn merge_checkpoint(
             .ok_or_else(|| artifact_error(format!("missing base tensor {key}")))?;
         let merged = merge_low_rank(original, &a, &b, rank, alpha)?;
         base.insert(key, merged);
+        progress(index + 1, total)?;
     }
     if !pairs.is_empty() {
         return Err(artifact_error("unexpected unmerged adapters"));
@@ -490,6 +511,25 @@ mod tests {
             Tensor::zeros((5,), DType::F32, &Device::Cpu)?,
         );
         Ok((base, checkpoint))
+    }
+
+    #[test]
+    fn merge_checkpoint_stops_between_adapter_updates() -> Result<()> {
+        let (base, checkpoint) = fixture()?;
+        let mut reached = Vec::new();
+        let result =
+            merge_checkpoint_with_progress(base, checkpoint, 1, 1.0, &mut |completed, total| {
+                reached.push((completed, total));
+                if completed == 1 {
+                    Err(crate::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(reached.last().copied(), Some((1, TARGETS.len() + 1)));
+        assert!(reached.iter().all(|&(completed, _)| completed <= 1));
+        Ok(())
     }
 
     #[test]

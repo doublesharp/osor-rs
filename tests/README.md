@@ -1,5 +1,15 @@
 # Reference acceptance tests
 
+The ignored `real_model_conversion_io_matches_qualified_bundle` test exercises
+the complete handle-based conversion and compares all output bytes by SHA-256
+with a pinned qualified bundle. It uses a digest-only sink and writes no weight
+files. Set `OSOR_TEST_BUNDLE`, `OSOR_TEST_MANIFEST_SHA256`, and the four local
+input paths `OSOR_TEST_BASE_UNET`, `OSOR_TEST_BASE_VAE`,
+`OSOR_TEST_CHECKPOINT`, and `OSOR_TEST_PROMPT`. Run it in release mode with
+`--ignored --nocapture --test-threads=1`. It uses a 14 GiB decoded input cap;
+allow additional transient memory. This is conversion byte-identity evidence,
+separate from numerical inference acceptance and application filesystem tests.
+
 Normal tests use small synthetic inputs and do not download weights. The ignored tests in [`real_model.rs`](real_model.rs) opt in to local full-model acceptance. They run inference with captured posterior and diffusion noise, collect all 18 pinned stages, and compare each element with the corresponding reference stage using an explicit absolute and relative tolerance. A seed alone is not sufficient for cross-framework parity.
 
 Capture `posterior_moments` from the raw VAE output: diffusers exposes it as `latent_dist.parameters`. Its `latent_dist.logvar` is already clamped to [-30,20], so concatenating `mean` and `logvar` does not reconstruct the raw moments. The separate `posterior_logvar` stage and posterior sampling use the clamped values. This distinction matters on actual photos with extreme log variance.

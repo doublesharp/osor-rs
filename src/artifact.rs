@@ -3,6 +3,8 @@
 //! Bundle files have fixed names. The digest is calculated over the same bytes
 //! used to construct each tensor, before the bundle is returned to the caller.
 
+pub(crate) mod stream;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
