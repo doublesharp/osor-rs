@@ -2,7 +2,7 @@
 
 The Rust port still trails upstream PyTorch on Apple GPUs. These are engineering measurements on a shared Apple M2 Max with 96 GiB memory, not release benchmarks or a general comparison of programming languages.
 
-## Unreleased follow-up: 2026-10-28
+## Pre-release follow-up: 2026-10-28
 
 Metal F32 VAE normalization now uses bounded, anchored two-pass reductions
 with affine application in a custom kernel. Bias addition and nearest
@@ -12,7 +12,7 @@ convolutions now use channel-major columns throughout the residual and
 sampling blocks; other device and dtype paths retain Candle.
 
 The final combined Metal profiling binary measured the same 640×384 photo,
-bundle, and explicit noise as v0.2.0. Loading took 8.115 s; the first inference
+bundle, and explicit noise as pre-release revision `d4af81e`. Loading took 8.115 s; the first inference
 took 1.493 s; three warm runs took 1.494, 1.537 and 1.679 s (mean **1.570 s**).
 Direct `/usr/bin/time -l` measured **10.596 GiB peak process footprint** over
 loading, retained inferences and the final synchronized stage profile. The
@@ -47,7 +47,7 @@ changed. The opt-in benchmark is
 Raw records remain under `/Volumes/Scratch/osor-rs/reports/codex-integration-20261028`
 and `/Volumes/Scratch/osor-rs/reports/codex-finish-20261028`.
 
-## v0.2.0 measurements: Candle 0.11
+## Pre-release measurements (`d4af81e`): Candle 0.11
 
 Measured with `--profile profiling` on Candle 0.11.0, Burn 0.22.1 and the column-convolution VAE path. Same inputs, bundle and captured noise as the earlier sections; F32, batch one, two warm runs after one first run; loading excluded from inference times. The host was shared (load average about 15).
 

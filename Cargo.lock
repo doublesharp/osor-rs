@@ -4862,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "osor"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "burn",
  "candle-core",

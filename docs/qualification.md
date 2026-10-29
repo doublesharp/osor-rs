@@ -2,7 +2,7 @@
 
 The complete Phase II model has executed on macOS/aarch64, Apple M2 Max, with CPU, Candle Metal, and Burn WGPU. This qualifies the named FP32 cases below; it does not establish accuracy for every image, reduced precision, or another platform.
 
-## Unreleased follow-up
+## Pre-release follow-up
 
 This section records snapshot `c08bdb9`: the follow-up committed as `b370d0d`
 and its loader resource-error correction. Subsequent attention-memory, cancellation,
@@ -73,7 +73,7 @@ from this snapshot's cross-build and autotune proof. Model loading verifies
 the original pinned bytes. Native Linux/Windows full-model execution, CUDA
 device execution and reduced-precision acceptance remain separate gates.
 
-## v0.2.0 numerical results
+## Pre-release numerical results (`d4af81e`)
 
 - The independent 80×96 random input passes all 18 stages against the existing frozen small-case limits on CPU, Metal, and WGPU. The full-bundle missing-critical-weight test passes.
 - A 704×368 CORNE-Val photo exposed a long-reduction precision problem. The measured WGPU normalization fixture improved from maximum error 0.004425 to 0.000005722 without changing its `1e-5` limit. A normal CPU regression also checks long groups against an independent F64 closed-form result.

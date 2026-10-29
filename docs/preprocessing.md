@@ -1,6 +1,6 @@
 # Reference image preprocessing
 
-These byte APIs are available in the unreleased checkout after v0.2.0.
+These byte APIs are included in the initial `osor` v0.1.0 Git release.
 
 The tensor inference API accepts normalized NCHW F32 RGB and grayscale mask tensors. The byte helpers in `osor::preprocess` reproduce the pinned upstream CLI's surrounding image operations using native Rust. They do not decode image files, download models, or load Python.
 

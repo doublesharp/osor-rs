@@ -32,12 +32,12 @@ The numerical recipe is pinned to [OSOR revision `d5b68e8`](https://github.com/Z
 
 ## Install
 
-Use the pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml). Add the Git dependency and commit your `Cargo.lock` to retain its resolved revision:
+Use the pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml). Add the tagged Git dependency and commit your `Cargo.lock` to retain its resolved revision. The crate is not yet published to crates.io:
 
 ```toml
 [dependencies.osor]
 git = "https://github.com/doublesharp/osor-rs"
-branch = "main"
+tag = "v0.1.0"
 # features = ["metal"]  # Enable for macOS Metal.
 ```
 
