@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
-
 ## 0.1.0 — 2026-10-29
 
-Initial Git release of the `osor` crate. Earlier versions were development-only;
-the former `v0.2.0` tag is retired. The repository remains `osor-rs`.
-The crate is not yet published to crates.io.
+Initial release of the `osor` crate. The repository remains `osor-rs`.
+
+### Packaging and documentation
+
+- Crates.io metadata, curated package contents, CPU-only docs.rs builds and a
+  manual publication workflow that runs the full CI suite before uploading.
+- Model-download/conversion instructions and a compilable API quick start.
 
 ### Inference and artifacts
 

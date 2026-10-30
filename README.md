@@ -32,19 +32,27 @@ The numerical recipe is pinned to [OSOR revision `d5b68e8`](https://github.com/Z
 
 ## Install
 
-Use the pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml). Add the tagged Git dependency and commit your `Cargo.lock` to retain its resolved revision. The crate is not yet published to crates.io:
+Requires Rust 1.95 or newer. Add the crate to your project:
+
+```toml
+[dependencies]
+osor = "0.1.0"
+# osor = { version = "0.1.0", features = ["metal"] }  # macOS Metal
+```
+
+See the [API documentation](https://docs.rs/osor),
+[model preparation guide](docs/model-preparation.md),
+and [changelog](CHANGELOG.md).
+
+<details>
+<summary>Use a Git tag or local checkout</summary>
 
 ```toml
 [dependencies.osor]
 git = "https://github.com/doublesharp/osor-rs"
 tag = "v0.1.0"
-# features = ["metal"]  # Enable for macOS Metal.
+# features = ["metal"]
 ```
-
-See the [changelog](CHANGELOG.md) for release history and API changes.
-
-<details>
-<summary>Develop from a local checkout</summary>
 
 ```toml
 [dependencies]
@@ -59,26 +67,27 @@ Install a [model bundle](#model-bundles) locally before loading the model.
 
 ## Use from Rust
 
-Load an `Osor` once with `Osor::load(bundle_path)` or `Osor::builder(bundle_path)...load()` and retain it across jobs. A loaded model is `Send + Sync`. Pass it and your tensors into synchronous inference:
+Load an `Osor`, generate noise, and pass normalized image and mask tensors into synchronous inference:
 
 ```rust
 use osor::{InferenceInput, InferenceResult, Osor, Result, Tensor};
 
-fn remove_object(
-    model: &Osor,
-    image: &Tensor,
-    mask: &Tensor,
-    posterior_noise: &Tensor,
-    diffusion_noise: &Tensor,
-) -> Result<InferenceResult> {
+fn remove_object(bundle: &str, image: &Tensor, mask: &Tensor) -> Result<InferenceResult> {
+    let model = Osor::load(bundle)?;
+    let image = image.to_device(model.device())?;
+    let mask = mask.to_device(model.device())?;
+    let (batch, _, height, width) = image.dims4()?;
+    let noise = model.seeded_noise(42, batch, height, width)?;
     model.infer(InferenceInput {
-        image,
-        mask,
-        posterior_noise,
-        diffusion_noise,
+        image: &image,
+        mask: &mask,
+        posterior_noise: &noise.posterior,
+        diffusion_noise: &noise.diffusion,
     })
 }
 ```
+
+Retain the loaded model across jobs to reuse its weights. A loaded model is `Send + Sync`.
 
 Inputs are NCHW tensors on `model.device()`:
 
@@ -154,10 +163,11 @@ bundle/
 
 It contains the base model with Phase II rank-256 LoRA adapters merged into its UNet, the trained five-channel output head, the VAE, and cached fixed prompt embeddings.
 
-The offline Rust converter accepts a conversion plan and local safetensors exports:
+Follow the [model preparation guide](docs/model-preparation.md) to download the four
+pinned safetensors inputs and create a conversion plan. Run the offline Rust converter:
 
 ```sh
-scripts/cargo.sh run --locked --bin osor -- convert /path/to/conversion.json
+scripts/cargo.sh run --locked --release --bin osor -- convert /path/to/conversion.json
 ```
 
 It validates critical weights and shapes, records source revisions and SHA-256 hashes, and creates a new bundle. See the [artifact contract](docs/artifacts.md) for the conversion schema, provenance, and model licensing.
@@ -249,6 +259,8 @@ cargo deny check
 The wrapper uses the pinned Rust toolchain and sccache, with build and temporary files under `/Volumes/Scratch/osor-rs`. Set `OSOR_SCRATCH_ROOT` to your Scratch directory on other hosts. Ordinary tests use small synthetic tensors; model tests use explicitly selected local bundles and reference artifacts.
 
 Keep models, reference source, tensors, images, captures, and reports outside Git.
+
+See [releasing](docs/releasing.md) for the publication workflow.
 
 ## License
 

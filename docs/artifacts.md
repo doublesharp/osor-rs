@@ -1,5 +1,8 @@
 # Local Phase II bundles
 
+For downloads and a complete conversion plan, start with the
+[model preparation guide](model-preparation.md).
+
 OSOR uses four fixed files in one local directory: `manifest.json`,
 `unet.safetensors`, `vae.safetensors`, and `prompt.safetensors`. No file is
 downloaded by the library. The UNet and VAE names are unprefixed diffusers

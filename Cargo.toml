@@ -4,8 +4,20 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT AND MIT-CMU"
-publish = false
+publish = ["crates-io"]
 description = "Native Rust OSOR SDXL Phase II inference"
+repository = "https://github.com/doublesharp/osor-rs"
+homepage = "https://github.com/doublesharp/osor-rs"
+documentation = "https://docs.rs/osor"
+readme = "README.md"
+keywords = ["inpainting", "object-removal", "sdxl", "inference", "candle"]
+categories = ["computer-vision", "multimedia::images", "science"]
+exclude = ["/.github/", "/AGENTS.md", "/.gitignore", "/deny.toml"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+all-features = false
 
 [features]
 default = []

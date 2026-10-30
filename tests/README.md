@@ -12,7 +12,7 @@ separate from numerical inference acceptance and application filesystem tests.
 
 Normal tests use small synthetic inputs and do not download weights. The ignored tests in [`real_model.rs`](real_model.rs) opt in to local full-model acceptance. They run inference with captured posterior and diffusion noise, collect all 18 pinned stages, and compare each element with the corresponding reference stage using an explicit absolute and relative tolerance. A seed alone is not sufficient for cross-framework parity.
 
-The unreleased follow-up retains passing acceptance for the two original cases.
+The pre-release follow-up retains passing acceptance for the two original cases.
 Additional B2/B4, odd-size, 512² and native 1024² photo cases have executed but
 exceed the unchanged frozen limits; see [qualification](../docs/qualification.md).
 The isolated CPU 1024² reference is now available after a guarded solo run.
